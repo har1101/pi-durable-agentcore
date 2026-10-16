@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: GitHub OIDC, ECR, and least-privilege roles for the Pi Durable AgentCore PoC
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub organization or user (for example har1101)
+  GitHubRepository:
+    Type: String
+    Default: pi-durable-agentcore
+    Description: Repository name without the owner
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Only this branch may assume the deployment role
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: Optional existing token.actions.githubusercontent.com provider ARN
+  EcrRepositoryName:
+    Type: String
+    Default: pi-durable-agentcore
+
+Conditions:
+  CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep the newest 20 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 20
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+
+  AgentRuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PullThisRepositoryImage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ContainerRepository.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+        - PolicyName: InvokeClaudeOnBedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-*
+                  - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*anthropic.claude-*
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateGitHubOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOwner}/${GitHubRepository}:ref:refs/heads/${GitHubBranch}
+      Policies:
+        - PolicyName: PushThisEcrRepository
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ContainerRepository.Arn
+        - PolicyName: DeployThisAgentCoreRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DiscoverRuntime
+                Effect: Allow
+                Action: bedrock-agentcore:ListAgentRuntimes
+                Resource: "*"
+              - Sid: CreateTaggedRuntime
+                Effect: Allow
+                Action: bedrock-agentcore:CreateAgentRuntime
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/Project: pi-durable-agentcore
+              - Sid: UpdateTaggedRuntime
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:UpdateAgentRuntime
+                Resource: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: pi-durable-agentcore
+              - Sid: PassOnlyExecutionRoleToAgentCore
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt AgentRuntimeExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: bedrock-agentcore.amazonaws.com
+
+Outputs:
+  GitHubDeployRoleArn:
+    Value: !GetAtt GitHubDeployRole.Arn
+  AgentRuntimeExecutionRoleArn:
+    Value: !GetAtt AgentRuntimeExecutionRole.Arn
+  EcrRepositoryName:
+    Value: !Ref ContainerRepository
+  EcrRepositoryUri:
+    Value: !GetAtt ContainerRepository.RepositoryUri

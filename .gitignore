@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.demo-state/
+*.tgz
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
