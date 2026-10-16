@@ -11,7 +11,8 @@ runtime_name="${AGENT_RUNTIME_NAME:-pi_durable_agentcore}"
 model_id="${BEDROCK_MODEL_ID:-global.anthropic.claude-sonnet-4-6}"
 image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
 artifact="{\"containerConfiguration\":{\"containerUri\":\"${image_uri}\"}}"
-environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\"}"
+table_name="${DYNAMODB_TABLE:-pi-durable-agentcore-sessions}"
+environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\"}"
 
 runtime_id="${AGENT_RUNTIME_ID:-}"
 if [[ -z "$runtime_id" ]]; then

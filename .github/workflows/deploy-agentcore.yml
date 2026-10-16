@@ -16,6 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22.19.0
@@ -50,5 +55,6 @@ jobs:
           AGENTCORE_EXECUTION_ROLE_ARN: ${{ vars.AGENTCORE_EXECUTION_ROLE_ARN }}
           AGENT_RUNTIME_NAME: ${{ vars.AGENT_RUNTIME_NAME }}
           BEDROCK_MODEL_ID: ${{ vars.BEDROCK_MODEL_ID }}
+          DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE }}
           IMAGE_TAG: ${{ github.sha }}
         run: bash scripts/deploy-agentcore.sh

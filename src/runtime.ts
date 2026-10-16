@@ -26,8 +26,8 @@ import {
   type AgentEventStream,
   type Conversation,
 } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { EventRecorder } from "./event-recorder.js";
+import { openSessionStorage } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -191,8 +191,12 @@ export class PiRuntime {
       }),
     );
 
+    const opened = await openSessionStorage({
+      sessionId: options.sessionId,
+      sessionPath: path,
+    });
     const harness = await Harness.open(
-      await openNodeSqliteStorage(join(path, "session.sqlite")),
+      opened.storage,
       {
         models,
         registry,
@@ -226,7 +230,8 @@ export class PiRuntime {
 
     await recorder.record("runtime_opened", {
       modelMode,
-      database: join(path, "session.sqlite"),
+      storage: opened.backend,
+      location: opened.location,
     });
     await recorder.record("conversation_snapshot", events.snapshot);
     events.start(async (batch) => {

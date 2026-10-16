@@ -1,25 +1,33 @@
 # Pi Durable on AgentCore Runtime PoC
 
 A minimal TypeScript service that runs `@earendil-works/pi-durable` behind the
-Amazon Bedrock AgentCore Runtime HTTP contract. It uses real Pi task checkpoints
-and SQLite persistence. Local execution is scripted and makes no network model
-calls; the container can use Claude through Bedrock with its AgentCore execution
-role.
+Amazon Bedrock AgentCore Runtime HTTP contract. Checkpoints go to a custom
+DynamoDB `Storage` (Pi Durable has no official DynamoDB backend: only Memory,
+SQLite, JSONL, and Cloudflare Durable Object SQLite). Local execution is
+scripted and uses DynamoDB Local; the container can use Claude through Bedrock
+with its AgentCore execution role.
+
+SQLite remains optional (`STORAGE_BACKEND=sqlite`).
 
 ## Local setup
 
-Requires Node.js 22.19 or newer.
+Requires Node.js 22.19 or newer and Java 21 (for DynamoDB Local).
 
 ```bash
 npm ci
 npm test
 ```
 
+`npm test` starts DynamoDB Local, then runs process-level tests against the
+real AWS DynamoDB client: crash→resume after `SIGKILL`, the AgentCore HTTP
+contract, two-owner lease contention (the loser is fenced), and Pi's storage
+conformance suite.
+
 Run the AgentCore-shaped HTTP server with the free scripted provider:
 
 ```bash
 npm run build
-MODEL_PROVIDER=scripted SCRIPTED_TOOL_DELAY_MS=50 npm start
+bash scripts/with-dynamodb-local.sh npm start
 
 curl http://localhost:8080/ping
 curl -X POST http://localhost:8080/invocations \
@@ -34,9 +42,10 @@ positions. `/ping` returns `HealthyBusy` while work is running.
 
 ## Real crash → resume demo
 
-This launches the compiled worker, waits until its real Pi tool task is running,
-sends that process `SIGKILL`, then launches a new process over the same SQLite
-file. The second process calls `Harness.resume()` and uses the original
+This launches the compiled worker against DynamoDB Local, waits until its real
+Pi tool task is running, sends that process `SIGKILL`, then launches a **new**
+process over the same DynamoDB session. The second process acquires the lease
+(after the dead owner's TTL), calls `Harness.resume()`, and uses the original
 `requestId`.
 
 ```bash
@@ -53,59 +62,39 @@ PASS crash->resume: attempts=2
 ```
 
 The integration suite exercises this same process boundary; it does not mock
-Pi Durable or its storage.
+Pi Durable or DynamoDB.
 
-## AWS bootstrap (do not run from local demo)
+## AWS bootstrap UPDATE (do not create a new stack)
 
-The one-time CloudFormation stack creates:
+The account already has `pi-durable-agentcore-bootstrap` in `CREATE_COMPLETE`.
+Do **not** run `create-stack`. Fukuchi updates that stack with
+`--profile fukuchi`. Pass `ExistingGitHubOidcProviderArn` as
+`UsePreviousValue=true` so CloudFormation does not recreate the OIDC provider.
 
-- a GitHub OIDC provider (or accepts an existing provider ARN);
-- an assume role restricted to this repository and `main`;
-- one ECR repository;
-- a deploy role scoped to that ECR repository, tagged AgentCore runtime, and
-  one execution role;
-- an AgentCore execution role that can pull this image and invoke Bedrock
-  Claude. No access keys are created.
-
-Required inputs:
-
-1. AWS CLI profile `fukuchi` with permission to create IAM, ECR, and
-   CloudFormation resources.
-2. AWS Region (example below uses `ap-northeast-1`).
-3. GitHub owner, repository (`har1101/pi-durable-agentcore` here), and allowed
-   deploy branch.
-4. If the AWS account already has GitHub's OIDC provider, its ARN.
-
-Fukuchi can run exactly:
+The 918f7b8 template diff and the same command live in
+`docs/bootstrap-update.md`.
 
 ```bash
-aws cloudformation deploy \
+aws cloudformation update-stack \
   --profile fukuchi \
   --region ap-northeast-1 \
   --stack-name pi-durable-agentcore-bootstrap \
-  --template-file infra/github-oidc-bootstrap.yaml \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    GitHubOwner=har1101 \
-    GitHubRepository=pi-durable-agentcore \
-    GitHubBranch=main
+  --parameters \
+    ParameterKey=GitHubOwner,ParameterValue=har1101 \
+    ParameterKey=GitHubRepository,ParameterValue=pi-durable-agentcore \
+    ParameterKey=GitHubBranch,ParameterValue=main \
+    ParameterKey=GitHubEnvironment,ParameterValue=agentcore-poc \
+    ParameterKey=SessionTableName,ParameterValue=pi-durable-agentcore-sessions \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
 ```
 
-If `token.actions.githubusercontent.com` already exists in that account, add:
-
-```bash
-ExistingGitHubOidcProviderArn=arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com
-```
-
-Read the output values:
-
-```bash
-aws cloudformation describe-stacks \
-  --profile fukuchi \
-  --region ap-northeast-1 \
-  --stack-name pi-durable-agentcore-bootstrap \
-  --query 'Stacks[0].Outputs'
-```
+The update adds the session table and least-privilege DynamoDB permissions on
+the existing execution role, and allows the GitHub environment `agentcore-poc`
+OIDC subject (the 918f7b8 trust policy only allowed `ref:refs/heads/main`).
+OIDC provider, ECR, and existing role logical IDs are unchanged.
 
 Create a GitHub environment named `agentcore-poc`, then set repository or
 environment variables:
@@ -115,19 +104,21 @@ environment variables:
 | `AWS_DEPLOY_ROLE_ARN`          | `GitHubDeployRoleArn` output                               |
 | `AGENTCORE_EXECUTION_ROLE_ARN` | `AgentRuntimeExecutionRoleArn` output                      |
 | `ECR_REPOSITORY`               | `EcrRepositoryName` output                                 |
+| `DYNAMODB_TABLE`               | `SessionTableName` output                                  |
 | `AWS_ACCOUNT_ID`               | 12-digit AWS account ID                                    |
 | `AWS_REGION`                   | bootstrap Region                                           |
 | `AGENT_RUNTIME_NAME`           | optional; defaults to `pi_durable_agentcore`               |
 | `BEDROCK_MODEL_ID`             | optional; defaults to `global.anthropic.claude-sonnet-4-6` |
 
 The workflow `.github/workflows/deploy-agentcore.yml` assumes the OIDC role,
-tests, builds an ARM64 image, pushes it, and creates or updates the HTTP runtime.
-It supplies `MODEL_PROVIDER=bedrock` to the deployed runtime. Local and image
-defaults remain `scripted`, preventing accidental paid model calls.
+tests against DynamoDB Local, builds an ARM64 image, pushes it, and creates or
+updates the HTTP runtime. It supplies `MODEL_PROVIDER=bedrock` and
+`STORAGE_BACKEND=dynamodb` to the deployed runtime. Local defaults remain
+scripted + DynamoDB Local, preventing accidental paid model calls.
 
-## Persistence boundary
+## Persistence
 
-SQLite proves process-crash recovery while the AgentCore session filesystem
-still exists. It does **not** survive termination/replacement of the microVM.
-Before production use, replace it with a remote Pi storage implementation and
-enforce Pi's single-writer rule with a conditional-write lease/fencing token.
+Each session is one DynamoDB partition. A conditional-write lease plus a
+monotonic fencing token enforces Pi's single-writer rule. Commits are
+idempotent and chunked under DynamoDB's 400 KB item limit. A replaced AgentCore
+microVM reopens the same table, steals an expired lease, and calls `resume()`.

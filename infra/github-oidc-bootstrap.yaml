@@ -20,6 +20,14 @@ Parameters:
   EcrRepositoryName:
     Type: String
     Default: pi-durable-agentcore
+  GitHubEnvironment:
+    Type: String
+    Default: agentcore-poc
+    Description: GitHub Actions environment whose OIDC sub may assume the deploy role
+  SessionTableName:
+    Type: String
+    Default: pi-durable-agentcore-sessions
+    Description: DynamoDB table for Pi Durable session checkpoints
 
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
@@ -54,6 +62,24 @@ Resources:
               "action": { "type": "expire" }
             }]
           }
+
+  SessionStore:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref SessionTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
 
   AgentRuntimeExecutionRole:
     Type: AWS::IAM::Role
@@ -90,6 +116,24 @@ Resources:
                 Resource:
                   - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-*
                   - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*anthropic.claude-*
+        - PolicyName: ReadWriteThisSessionTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchGetItem
+                  - dynamodb:ConditionCheckItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:TransactGetItems
+                  - dynamodb:TransactWriteItems
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt SessionStore.Arn
+                  - !Sub ${SessionStore.Arn}/index/*
 
   GitHubDeployRole:
     Type: AWS::IAM::Role
@@ -107,7 +151,9 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOwner}/${GitHubRepository}:ref:refs/heads/${GitHubBranch}
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOwner}/${GitHubRepository}:ref:refs/heads/${GitHubBranch}
+                  - !Sub repo:${GitHubOwner}/${GitHubRepository}:environment:${GitHubEnvironment}
       Policies:
         - PolicyName: PushThisEcrRepository
           PolicyDocument:
@@ -165,3 +211,7 @@ Outputs:
     Value: !Ref ContainerRepository
   EcrRepositoryUri:
     Value: !GetAtt ContainerRepository.RepositoryUri
+  SessionTableName:
+    Value: !Ref SessionStore
+  SessionTableArn:
+    Value: !GetAtt SessionStore.Arn
