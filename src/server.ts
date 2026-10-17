@@ -5,6 +5,11 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import { SessionFailed } from "@earendil-works/pi-durable";
+import {
+  APPROVER_TOKEN_HEADER,
+  approverAuthorized,
+  parseCommand,
+} from "./commands.js";
 import { PiRuntime, sessionDirectory, type ModelMode } from "./runtime.js";
 import { openEventLog } from "./storage/open.js";
 
@@ -104,28 +109,46 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/invocations") {
-      const input = await body(request);
-      if (typeof input.prompt !== "string" || input.prompt.trim() === "") {
+      const parsed = parseCommand(await body(request));
+      if (!parsed.ok) {
         response.setHeader("x-amzn-ErrorType", "ValidationException");
-        json(response, 400, { message: "prompt must be a non-empty string" });
+        json(response, 400, { message: parsed.message });
         return;
       }
-      if (
-        input.requestId !== undefined &&
-        typeof input.requestId !== "string"
-      ) {
-        response.setHeader("x-amzn-ErrorType", "ValidationException");
-        json(response, 400, { message: "requestId must be a string" });
+      const command = parsed.value;
+      if (command.action === "invoke") {
+        const runtime = await runtimeFor(sessionId(request));
+        json(
+          response,
+          200,
+          await runtime.invoke({
+            prompt: command.prompt,
+            ...(command.requestId !== undefined
+              ? { requestId: command.requestId }
+              : {}),
+          }),
+        );
+        return;
+      }
+      const token = request.headers[APPROVER_TOKEN_HEADER];
+      if (!approverAuthorized(Array.isArray(token) ? token[0] : token)) {
+        response.setHeader("x-amzn-ErrorType", "AccessDeniedException");
+        json(response, 403, { message: "approver token missing or invalid" });
         return;
       }
       const runtime = await runtimeFor(sessionId(request));
-      const result = await runtime.invoke({
-        prompt: input.prompt,
-        ...(typeof input.requestId === "string"
-          ? { requestId: input.requestId }
-          : {}),
-      });
-      json(response, 200, result);
+      const decided = await runtime.decide(command.approvalId, command.decision);
+      if (decided.outcome === "not_found") {
+        response.setHeader("x-amzn-ErrorType", "ResourceNotFoundException");
+        json(response, 404, { message: `unknown approval ${command.approvalId}` });
+        return;
+      }
+      const conflicting =
+        decided.outcome === "already_decided" &&
+        decided.approval?.status !==
+          (command.decision === "approve" ? "approved" : "rejected");
+      if (conflicting) response.setHeader("x-amzn-ErrorType", "ConflictException");
+      json(response, conflicting ? 409 : 200, decided);
       return;
     }
 

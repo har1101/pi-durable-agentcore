@@ -22,14 +22,35 @@ function lastUserIndex(transcript: TranscriptContext): number {
   return lastUser;
 }
 
-function toolResultText(transcript: TranscriptContext): string | undefined {
+function lastUserText(transcript: TranscriptContext): string {
+  const message = transcript.messages[lastUserIndex(transcript)];
+  if (message?.role !== "user") return "";
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.map((item) => (item.type === "text" ? item.text : "")).join("");
+}
+
+function toolResult(
+  transcript: TranscriptContext,
+): { toolName: string; text: string } | undefined {
   const result = transcript.messages
     .slice(lastUserIndex(transcript) + 1)
     .find((message) => message.role === "toolResult");
   if (result?.role !== "toolResult") return undefined;
-  return result.content
-    .map((item) => (item.type === "text" ? item.text : ""))
-    .join("");
+  return {
+    toolName: result.toolName,
+    text: result.content
+      .map((item) => (item.type === "text" ? item.text : ""))
+      .join(""),
+  };
+}
+
+/** Prompt directives pick the scripted tool: `[approval]`, else `durable_wait`. */
+function scriptedToolCall(prompt: string) {
+  if (prompt.includes("[approval]")) {
+    return fauxToolCall("approved_action", { action: "deploy" }, { id: SCRIPTED_TOOL_CALL_ID });
+  }
+  return fauxToolCall("durable_wait", { label: "crash-window" }, { id: SCRIPTED_TOOL_CALL_ID });
 }
 
 /** Free, deterministic stand-in for Bedrock: one tool call, then an answer. */
@@ -42,20 +63,16 @@ export function scriptedResponse(transcript: TranscriptContext): AssistantMessag
         "Provider is not configured: amazon-bedrock",
     });
   }
-  const result = toolResultText(transcript);
-  if (result !== undefined) {
+  const result = toolResult(transcript);
+  if (result?.toolName === "durable_wait") {
     return fauxAssistantMessage([
       fauxText("Finished after the durable tool checkpoint was committed."),
     ]);
   }
-  return fauxAssistantMessage(
-    [
-      fauxToolCall(
-        "durable_wait",
-        { label: "crash-window" },
-        { id: SCRIPTED_TOOL_CALL_ID },
-      ),
-    ],
-    { stopReason: "toolUse" },
-  );
+  if (result !== undefined) {
+    return fauxAssistantMessage([fauxText(`Finished: ${result.text}`)]);
+  }
+  return fauxAssistantMessage([scriptedToolCall(lastUserText(transcript))], {
+    stopReason: "toolUse",
+  });
 }

@@ -8,7 +8,14 @@ import {
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
+import type { EffectLedger } from "./effects.js";
 import type { EventLog } from "./event-log.js";
+import {
+  approvalIdFor,
+  Suspensions,
+  type Approval,
+  type SuspensionsState,
+} from "./suspensions.js";
 
 declare const idempotencyKeyBrand: unique symbol;
 /** 64 hex chars. Derived from a hashed session id and the tool task id. */
@@ -33,6 +40,8 @@ export function toolIdempotencyKey(
 export interface ToolScope {
   readonly sessionId: string;
   readonly events: EventLog;
+  readonly effects: EffectLedger;
+  readonly now: () => number;
 }
 
 export interface KeyedCall {
@@ -117,6 +126,119 @@ export function durableWaitTool(scope: ToolScope, delayMs: number) {
       });
       return {
         output: [{ type: "text", text: `waited ${delayMs}ms for ${label}` }],
+      };
+    },
+  });
+}
+
+function copy<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Resolve once `select` finds a value in the committed suspensions document. */
+export async function watchSuspensions<T>(
+  observer: Pick<ToolExecutionApi, "watchDoc">,
+  select: (state: SuspensionsState | undefined) => T | undefined,
+  context: Context,
+): Promise<T> {
+  const watch = await observer.watchDoc(Suspensions, context);
+  if (watch === undefined) throw new Error("app.suspensions document is missing");
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      const check = (state: Readonly<SuspensionsState> | null) => {
+        const found = select(state ?? undefined);
+        if (found !== undefined) resolve(found);
+      };
+      check(watch.value);
+      watch.start(async (state) => check(state));
+      void watch.closed.then((end) =>
+        reject(new Error(`suspensions watch ended: ${end.reason}`)),
+      );
+      const signal = context.abortSignal;
+      if (signal?.aborted) reject(signal.reason);
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  } finally {
+    await watch.stop();
+  }
+}
+
+/**
+ * Parks the call until an approver decides. The pending approval is committed
+ * before the wait, and the tool is replay-safe, so a new process reruns it,
+ * finds the same approval (its id derives from the idempotency key), and
+ * continues once it is decided. Only `approved` runs `execute`.
+ */
+export function approvalGatedTool<P extends TSchema>(
+  scope: ToolScope,
+  timeoutMs: number,
+  definition: KeyedToolDefinition<P> & { summarize(args: Static<P>): string },
+) {
+  return defineKeyedTool(scope, {
+    ...definition,
+    replay: "safe",
+    execute: async (args, call, context) => {
+      const id = approvalIdFor(call.key);
+      const created = await call.api.commit(async (tx) => {
+        const state = await tx.doc(Suspensions);
+        if (state.items[id] !== undefined) return undefined;
+        const requestedAt = scope.now();
+        const approval: Approval = {
+          kind: "approval",
+          id,
+          tool: definition.name,
+          summary: definition.summarize(args),
+          requestedAt,
+          deadline: requestedAt + timeoutMs,
+          status: "pending",
+        };
+        state.items[id] = approval;
+        return copy(approval);
+      }, context);
+      if (created !== undefined) {
+        await scope.events.record("approval_requested", created);
+      }
+      const decided = await watchSuspensions(
+        call.api,
+        (state) => {
+          const item = state?.items[id];
+          return item?.kind === "approval" && item.status !== "pending"
+            ? copy(item)
+            : undefined;
+        },
+        context,
+      );
+      if (decided.status !== "approved") {
+        return {
+          output: [
+            {
+              type: "text",
+              text: `Approval ${id} was rejected (${decided.status === "rejected" ? decided.decidedBy : "unknown"}); ${definition.name} did not run.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      return definition.execute(args, call, context);
+    },
+  });
+}
+
+export function approvedActionTool(scope: ToolScope, timeoutMs: number) {
+  return approvalGatedTool(scope, timeoutMs, {
+    name: "approved_action",
+    description: "Perform an action that a human must approve first.",
+    parameters: Type.Object({ action: Type.String() }),
+    summarize: ({ action }) => `approved_action: ${action}`,
+    execute: async ({ action }, call) => {
+      const effect = await scope.effects.apply(call.key, { action });
+      await scope.events.record("side_effect", {
+        action,
+        idempotencyKey: call.key,
+        effect,
+      });
+      return {
+        output: [{ type: "text", text: `Action ${action} applied (${effect}).` }],
       };
     },
   });

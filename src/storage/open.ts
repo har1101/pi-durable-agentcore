@@ -1,6 +1,11 @@
 import { join } from "node:path";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import type { Storage } from "@earendil-works/pi-durable";
+import {
+  DynamoDbEffectLedger,
+  MemoryEffectLedger,
+  type EffectLedger,
+} from "../effects.js";
 import { DynamoDbEventLog, FileEventLog, type EventLog } from "../event-log.js";
 import {
   createDynamoDbDocumentClient,
@@ -22,6 +27,7 @@ export interface SessionBackend {
   readonly location: string;
   readonly storage: Storage;
   readonly events: EventLog;
+  readonly effects: EffectLedger;
 }
 
 export function configuredStorageBackend(): StorageBackend {
@@ -101,6 +107,7 @@ export async function openSessionBackend(
       backend,
       storage,
       events,
+      effects: new DynamoDbEffectLedger(await sessionTableClient(), tableName),
       location: `dynamodb:${tableName}#${options.sessionId}`,
     };
   }
@@ -112,6 +119,7 @@ export async function openSessionBackend(
     backend,
     storage: await openNodeSqliteStorage(database),
     events,
+    effects: new MemoryEffectLedger(),
     location: database,
   };
 }

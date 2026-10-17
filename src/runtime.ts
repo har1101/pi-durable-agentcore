@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import {
+  BACKGROUND_CONTEXT,
+  withCancel,
+} from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
@@ -16,6 +19,7 @@ import {
   type AgentEventStream,
   type Conversation,
   type SettledSubmissionRecord,
+  type Submission,
 } from "@earendil-works/pi-durable";
 import {
   applyBedrockRuntimeEnv,
@@ -23,7 +27,19 @@ import {
 } from "./bedrock-provider.js";
 import type { EventLog } from "./event-log.js";
 import { scriptedResponse } from "./scripted-model.js";
-import { durableWaitTool } from "./tools.js";
+import {
+  activeSuspensions,
+  decide,
+  Suspensions,
+  type Approval,
+  type DecisionOutcome,
+  type Suspension,
+} from "./suspensions.js";
+import {
+  approvedActionTool,
+  durableWaitTool,
+  watchSuspensions,
+} from "./tools.js";
 import { openSessionBackend } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -43,13 +59,65 @@ export interface InvokeInput {
   requestId?: string;
 }
 
-export interface InvokeResult {
+interface ResultBase {
   response: string;
-  requestId: string;
   sessionId: string;
-  status: "success" | "error";
-  reason?: string;
-  detail?: unknown;
+}
+
+/** What an invocation reports: the run's answer, its failure, or why it is parked. */
+export type InvokeResult =
+  | (ResultBase & { status: "success"; requestId: string })
+  | (ResultBase & {
+      status: "error";
+      requestId: string;
+      reason: string;
+      detail?: unknown;
+    })
+  | (ResultBase & {
+      status: "pending";
+      requestId: string;
+      reason: "approval_required";
+      approvalId: string;
+      expiresAt: string;
+    })
+  | (ResultBase & {
+      status: "pending";
+      requestId: string;
+      reason: "timer";
+      wakeAt: string;
+    })
+  | (ResultBase & { status: "idle" });
+
+export interface DecisionResult {
+  outcome: DecisionOutcome["kind"];
+  approval?: Approval;
+  result: InvokeResult;
+}
+
+function pendingResult(
+  parked: Suspension,
+  requestId: string,
+  sessionId: string,
+): InvokeResult {
+  if (parked.kind === "approval") {
+    return {
+      status: "pending",
+      reason: "approval_required",
+      approvalId: parked.id,
+      expiresAt: new Date(parked.deadline).toISOString(),
+      requestId,
+      sessionId,
+      response: `Waiting for approval ${parked.id}.`,
+    };
+  }
+  return {
+    status: "pending",
+    reason: "timer",
+    wakeAt: new Date(parked.wakeAt).toISOString(),
+    requestId,
+    sessionId,
+    response: `Waiting until ${new Date(parked.wakeAt).toISOString()}.`,
+  };
 }
 
 export function sessionDirectory(
@@ -162,14 +230,24 @@ export class PiRuntime {
     const delayMs =
       options.scriptedDelayMs ??
       Number(process.env.SCRIPTED_TOOL_DELAY_MS ?? 5_000);
-    const scope = { sessionId: options.sessionId, events: recorder };
-    const waitTool = durableWaitTool(scope, delayMs);
+    const scope = {
+      sessionId: options.sessionId,
+      events: recorder,
+      effects: opened.effects,
+      now: () => Date.now(),
+    };
+    const approvalTimeoutMs = Number(
+      process.env.APPROVAL_TIMEOUT_MS ?? 24 * 60 * 60 * 1000,
+    );
 
     const registry = createRegistry();
     registry.install(
       defineExtension({
         name: "poc-durable-wait",
-        tools: [waitTool],
+        tools: [
+          durableWaitTool(scope, delayMs),
+          approvedActionTool(scope, approvalTimeoutMs),
+        ],
         hooks: [
           hook(GenerationTask, {
             afterResponse: (message) =>
@@ -205,6 +283,9 @@ export class PiRuntime {
           }
         : { provider: "faux", modelId: "faux-1" };
     const root = await harness.root(context, { agent: { model } });
+    if ((await harness.snapshot(Suspensions, context)) === undefined) {
+      await harness.commit((tx) => tx.doc(Suspensions), context);
+    }
     const events = await watchEvents(harness, root.id, context);
     const runtime = new PiRuntime(
       options.sessionId,
@@ -255,43 +336,138 @@ export class PiRuntime {
         },
         context,
       );
-      const settled = await submission.wait(context);
-      if (settled.status === "unanswered" || settled.type !== "input") {
-        const payload = unansweredPayload(settled);
-        await this.recorder.record("invocation_failed", {
-          requestId,
-          reason: payload.reason,
-          detail: payload.detail ?? null,
-        });
-        return {
-          response: payload.message,
-          requestId,
-          sessionId: this.sessionId,
-          status: "error",
-          reason: payload.reason,
-          ...(payload.detail !== undefined ? { detail: payload.detail } : {}),
-        };
-      }
-      const answer = await this.root.commit(
-        (transaction) => transaction.entry(AssistantEntry, settled.answer),
+      return await this.#outcome(submission, requestId);
+    } finally {
+      this.#busy--;
+    }
+  }
+
+  /**
+   * Record an approver's decision and continue the parked run. The first
+   * decision wins, so a repeat or a late approval after a timeout changes
+   * nothing.
+   */
+  async decide(
+    approvalId: string,
+    decision: "approve" | "reject",
+  ): Promise<DecisionResult> {
+    this.#busy++;
+    try {
+      const active = await this.#activeSubmission();
+      const outcome = await this.harness.commit(
+        async (tx) =>
+          JSON.parse(
+            JSON.stringify(
+              decide(await tx.doc(Suspensions), approvalId, decision, Date.now()),
+            ),
+          ) as DecisionOutcome,
         context,
       );
-      const response = assistantText(
-        answer?.model?.[0] as AssistantMessage | undefined,
-      );
-      await this.recorder.record("invocation_completed", {
-        requestId,
-        response,
+      await this.recorder.record("approval_decision", {
+        approvalId,
+        decision,
+        outcome: outcome.kind,
+        ...(outcome.kind !== "not_found"
+          ? { status: outcome.approval.status }
+          : {}),
       });
+      const result =
+        outcome.kind !== "not_found" && active !== undefined
+          ? await this.#outcome(active.submission, active.requestId)
+          : this.#idle();
       return {
-        response,
-        requestId,
-        sessionId: this.sessionId,
-        status: "success",
+        outcome: outcome.kind,
+        ...(outcome.kind !== "not_found" ? { approval: outcome.approval } : {}),
+        result,
       };
     } finally {
       this.#busy--;
     }
+  }
+
+  #idle(): InvokeResult {
+    return { status: "idle", sessionId: this.sessionId, response: "" };
+  }
+
+  /** The root input a run is working on or has queued, if any. */
+  async #activeSubmission(): Promise<
+    { submission: Submission; requestId: string } | undefined
+  > {
+    const inspection = await this.harness.inspect(context);
+    const record = inspection.submissions.find(
+      (item) => item.type === "input" && item.conversationId === this.root.id,
+    );
+    if (record === undefined) return undefined;
+    const submission = await this.harness.submission(record.id, context);
+    if (submission === undefined) return undefined;
+    return { submission, requestId: record.requestId ?? String(record.id) };
+  }
+
+  /** Settled answer, or the suspension the run parked on, whichever comes first. */
+  async #outcome(
+    submission: Submission,
+    requestId: string,
+  ): Promise<InvokeResult> {
+    const race = withCancel(context);
+    try {
+      const result = await Promise.race([
+        submission
+          .wait(race.context)
+          .then((settled) => this.#settledResult(settled, requestId)),
+        watchSuspensions(
+          this.harness,
+          (state) => activeSuspensions(state)[0],
+          race.context,
+        ).then((parked) =>
+          pendingResult(parked, requestId, this.sessionId),
+        ),
+      ]);
+      if (result.status === "pending") {
+        await this.recorder.record("invocation_pending", result);
+      }
+      return result;
+    } finally {
+      race.cancel(new Error("outcome decided"));
+    }
+  }
+
+  async #settledResult(
+    settled: SettledSubmissionRecord,
+    requestId: string,
+  ): Promise<InvokeResult> {
+    if (settled.status === "unanswered" || settled.type !== "input") {
+      const payload = unansweredPayload(settled);
+      await this.recorder.record("invocation_failed", {
+        requestId,
+        reason: payload.reason,
+        detail: payload.detail ?? null,
+      });
+      return {
+        response: payload.message,
+        requestId,
+        sessionId: this.sessionId,
+        status: "error",
+        reason: payload.reason,
+        ...(payload.detail !== undefined ? { detail: payload.detail } : {}),
+      };
+    }
+    const answer = await this.root.commit(
+      (transaction) => transaction.entry(AssistantEntry, settled.answer),
+      context,
+    );
+    const response = assistantText(
+      answer?.model?.[0] as AssistantMessage | undefined,
+    );
+    await this.recorder.record("invocation_completed", {
+      requestId,
+      response,
+    });
+    return {
+      response,
+      requestId,
+      sessionId: this.sessionId,
+      status: "success",
+    };
   }
 
   async close(): Promise<void> {
