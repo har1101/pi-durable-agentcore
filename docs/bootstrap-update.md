@@ -133,6 +133,8 @@ version, `workload-identity/*`, and
 Create/Get/List/UpdateWorkloadIdentity. Do **not** replace OIDC, roles,
 ECR, or DynamoDB. Every parameter keeps its previous value.
 
+Fukuchi applied **359c28f**: stack **UPDATE_COMPLETE**. Retrigger GHA deploy.
+
 ```bash
 aws cloudformation update-stack \
   --profile fukuchi \
