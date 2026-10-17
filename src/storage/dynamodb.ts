@@ -8,6 +8,7 @@ import {
   ResourceInUseException,
   ResourceNotFoundException,
   TransactionCanceledException,
+  UpdateTableCommand,
   waitUntilTableExists,
   type DynamoDBClientConfig,
 } from "@aws-sdk/client-dynamodb";
@@ -76,10 +77,14 @@ function asSeq(value: number): Seq {
   return value as Seq;
 }
 
-function sessionPk(sessionId: string): string {
+/** Partition of one session's Pi commit log (and lease). Raw session ids never appear in keys. */
+export function sessionPk(sessionId: string): string {
   const digest = createHash("sha256").update(sessionId).digest("hex");
   return `s#${digest}`;
 }
+
+/** Sparse GSI over armed wake-up items: `wakeShard` (S) + `wakeDueAt` (N, epoch ms). */
+export const WAKE_INDEX_NAME = "WakeIndex";
 
 function commitSk(seq: number, chunk?: number): string {
   const base = `${COMMIT_PREFIX}${String(seq).padStart(16, "0")}`;
@@ -177,11 +182,14 @@ export async function ensureSessionTable(
         AttributeDefinitions: [
           { AttributeName: "pk", AttributeType: "S" },
           { AttributeName: "sk", AttributeType: "S" },
+          { AttributeName: "wakeShard", AttributeType: "S" },
+          { AttributeName: "wakeDueAt", AttributeType: "N" },
         ],
         KeySchema: [
           { AttributeName: "pk", KeyType: "HASH" },
           { AttributeName: "sk", KeyType: "RANGE" },
         ],
+        GlobalSecondaryIndexes: [wakeIndexDefinition()],
       }),
     );
   } catch (error) {
@@ -197,6 +205,37 @@ export async function ensureSessionTable(
   if (described.Table?.TableStatus !== "ACTIVE") {
     throw new Error(`DynamoDB table ${tableName} is not ACTIVE`);
   }
+  const hasWakeIndex = (described.Table.GlobalSecondaryIndexes ?? []).some(
+    (index) => index.IndexName === WAKE_INDEX_NAME,
+  );
+  if (!hasWakeIndex) {
+    // A table created before auto-resume existed: add the GSI in place.
+    try {
+      await lowLevel.send(
+        new UpdateTableCommand({
+          TableName: tableName,
+          AttributeDefinitions: [
+            { AttributeName: "wakeShard", AttributeType: "S" },
+            { AttributeName: "wakeDueAt", AttributeType: "N" },
+          ],
+          GlobalSecondaryIndexUpdates: [{ Create: wakeIndexDefinition() }],
+        }),
+      );
+    } catch (error) {
+      if (!(error instanceof ResourceInUseException)) throw error;
+    }
+  }
+}
+
+function wakeIndexDefinition() {
+  return {
+    IndexName: WAKE_INDEX_NAME,
+    KeySchema: [
+      { AttributeName: "wakeShard", KeyType: "HASH" as const },
+      { AttributeName: "wakeDueAt", KeyType: "RANGE" as const },
+    ],
+    Projection: { ProjectionType: "ALL" as const },
+  };
 }
 
 function maxIdFromWrites(writes: readonly StorageWrite[]): number {

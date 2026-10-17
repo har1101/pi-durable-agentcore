@@ -8,6 +8,7 @@ export interface OpenSessionStorageOptions {
   readonly sessionId: string;
   readonly sessionPath: string;
   readonly backend?: StorageBackend;
+  readonly acquireTimeoutMs?: number;
 }
 
 export function configuredStorageBackend(): StorageBackend {
@@ -31,9 +32,9 @@ export async function openSessionStorage(
       ...(endpoint !== undefined && endpoint !== "" ? { endpoint } : {}),
       ...(region !== undefined && region !== "" ? { region } : {}),
       leaseTtlMs: Number(process.env.PI_SESSION_LEASE_TTL_MS ?? 15_000),
-      acquireTimeoutMs: Number(
-        process.env.PI_SESSION_LEASE_ACQUIRE_TIMEOUT_MS ?? 12_000,
-      ),
+      acquireTimeoutMs:
+        options.acquireTimeoutMs ??
+        Number(process.env.PI_SESSION_LEASE_ACQUIRE_TIMEOUT_MS ?? 12_000),
       ensureTable: Boolean(process.env.DYNAMODB_ENDPOINT),
     });
     return {
