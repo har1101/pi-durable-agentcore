@@ -12,6 +12,7 @@
     "start": "node dist/server.js",
     "demo:submit": "node dist/demo-worker.js submit",
     "demo:resume": "node dist/demo-worker.js resume",
+    "approval:sign": "node dist/sign-approval.js",
     "pretest": "npm run build",
     "test": "bash scripts/with-dynamodb-local.sh npx vitest run",
     "demo:crash-resume": "bash scripts/with-dynamodb-local.sh bash scripts/demo-crash-resume.sh"

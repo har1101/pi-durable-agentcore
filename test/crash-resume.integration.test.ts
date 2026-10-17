@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { openEventRecorder, sessionDirectory } from "../dist/storage/open.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -49,6 +50,23 @@ describe("real process integration against DynamoDB Local", () => {
     expect(resumedLog).toContain(
       "Finished after the durable tool checkpoint was committed.",
     );
+
+    // TOOL_ATTEMPT records are in the durable event log, not in /tmp files:
+    // both attempts (SIGKILLed and resumed) carry one idempotency key.
+    const recorder = await openEventRecorder(
+      sessionId,
+      sessionDirectory(state, sessionId),
+    );
+    const attempts = (await recorder.list()).filter(
+      (event) => event.kind === "tool_attempt",
+    );
+    expect(attempts).toHaveLength(2);
+    expect(new Set(attempts.map((event) => event.pid)).size).toBe(2);
+    const keys = attempts.map(
+      (event) => (event.detail as { idempotencyKey: string }).idempotencyKey,
+    );
+    expect(keys[0]).toMatch(/^idem_v1_[0-9a-f]{64}$/);
+    expect(keys[1]).toBe(keys[0]);
   }, 50_000);
 
   it("serves the AgentCore HTTP contract with DynamoDB Local", async () => {
