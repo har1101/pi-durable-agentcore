@@ -352,6 +352,34 @@ This only flips the rule to `ENABLED`, scopes the sweeper's invoke statement
 to the runtime, and sets the Lambda's `AGENT_RUNTIME_ARN`. Later updates pass
 `ParameterKey=AgentRuntimeArn,UsePreviousValue=true`.
 
+Then smoke-check the sweeper once by hand:
+
+```bash
+aws cloudformation wait stack-update-complete \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap
+
+sweeper_arn="$(aws cloudformation describe-stacks \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --query "Stacks[0].Outputs[?OutputKey=='WakeSweeperFunctionArn'].OutputValue" \
+  --output text)"
+
+aws lambda invoke \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --function-name "$sweeper_arn" \
+  sweep.json
+cat sweep.json
+```
+
+`sweep.json` must hold a JSON sweep report such as `{"due":0,"outcomes":{}}`.
+A `"FunctionError"` in the invoke output, or `Cannot find module` in
+`sweep.json`, means the inline code or the Lambda runtime's SDK is wrong.
+Re-apply with `AgentRuntimeArn=""` to disable the rule, then fix the code.
+
 ### New parameter and outputs
 
 | Name                     | Kind      | Value                                                        |
@@ -375,7 +403,9 @@ identity:
 - The runtime accepts a decision only when that id is in `APPROVER_USER_IDS`
   (comma separated, set by `deploy-agentcore.sh` from the environment
   variable of the same name). A missing header, an unknown id, or an empty
-  list is 403. The user who started the run cannot approve it.
+  list is 403. The user who started the run cannot approve it. The requester
+  is stored with the run's input, so this holds after a reopen, a
+  crash-resume, or a re-sent `requestId`.
 - The caller asserts `runtimeUserId`, and IAM is what makes it trustworthy.
   Grant `InvokeAgentRuntimeForUser` only to approver principals. Requesters
   get `InvokeAgentRuntime` only. `GitHubDeployRole` already has both, so GHA
@@ -406,6 +436,19 @@ on create and update. The shape matches the `CreateAgentRuntime` and
 runner's AWS CLI must be recent enough to know the flag. Pending approvals
 do not depend on this: a parked session holds no process, and the sweeper
 starts a new microVM when the session is due.
+
+### Known limits
+
+- The sweeper has no backoff. A session whose resume keeps failing is
+  retried every minute until its wake is cleared.
+- A decision written by a process that does not hold the session lease does
+  not wake the gate that waits for it. The next sweep after that runtime parks
+  applies it, or the gate sees it at its deadline. This is rare on AgentCore,
+  which pins a session to one microVM.
+- An invoke without `runtimeUserId` records no requester. An approver who
+  starts a run that way can approve it. This follows from a caller-chosen
+  `runtimeUserId`. IAM on `InvokeAgentRuntimeForUser` controls who may assert
+  an id, and the runtime cannot tell an anonymous approver from anyone else.
 
 Required inputs: AWS CLI profile `fukuchi`, region `ap-northeast-1`, the
 updated `infra/github-oidc-bootstrap.yaml`, and `CAPABILITY_NAMED_IAM`.
