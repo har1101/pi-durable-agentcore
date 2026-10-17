@@ -32,6 +32,7 @@ if [[ -z "$runtime_id" || "$runtime_id" == "None" ]]; then
     --network-configuration '{"networkMode":"PUBLIC"}' \
     --protocol-configuration '{"serverProtocol":"HTTP"}' \
     --environment-variables "$environment" \
+    --observability-configuration '{"enabled":true}' \
     --platform-version V2 \
     --tags Project=pi-durable-agentcore \
     --output json | tee /tmp/agentcore-runtime.json
@@ -44,6 +45,7 @@ else
     --network-configuration '{"networkMode":"PUBLIC"}' \
     --protocol-configuration '{"serverProtocol":"HTTP"}' \
     --environment-variables "$environment" \
+    --observability-configuration '{"enabled":true}' \
     --metadata-configuration '{"requireMMDSV2":true}' \
     --platform-version V2 \
     --output json | tee /tmp/agentcore-runtime.json

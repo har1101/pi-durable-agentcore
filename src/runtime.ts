@@ -8,7 +8,6 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { amazonBedrockProvider } from "@earendil-works/pi-ai/providers/amazon-bedrock";
 import {
   fauxAssistantMessage,
   fauxProvider,
@@ -25,7 +24,12 @@ import {
   watchEvents,
   type AgentEventStream,
   type Conversation,
+  type SettledSubmissionRecord,
 } from "@earendil-works/pi-durable";
+import {
+  applyBedrockRuntimeEnv,
+  createConfiguredAmazonBedrockProvider,
+} from "./bedrock-provider.js";
 import { EventRecorder } from "./event-recorder.js";
 import { openSessionStorage } from "./storage/open.js";
 
@@ -50,6 +54,9 @@ export interface InvokeResult {
   response: string;
   requestId: string;
   sessionId: string;
+  status: "success" | "error";
+  reason?: string;
+  detail?: unknown;
 }
 
 function sessionDirectory(stateDirectory: string, sessionId: string): string {
@@ -75,6 +82,14 @@ function scriptedResponse(
   _options: unknown,
   state: FauxProviderState,
 ): AssistantMessage {
+  if (process.env.SCRIPTED_MODEL_ERROR === "1") {
+    return fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage:
+        process.env.SCRIPTED_MODEL_ERROR_MESSAGE ??
+        "Provider is not configured: amazon-bedrock",
+    });
+  }
   if (hasToolResultAfterLastUser(transcript)) {
     return fauxAssistantMessage([
       fauxText("Finished after the durable tool checkpoint was committed."),
@@ -90,6 +105,29 @@ function scriptedResponse(
     ],
     { stopReason: "toolUse" },
   );
+}
+
+function unansweredPayload(settled: SettledSubmissionRecord): {
+  message: string;
+  reason: string;
+  detail?: unknown;
+} {
+  const reason =
+    settled.status === "unanswered" ? settled.reason : settled.status;
+  const detail = settled.status === "unanswered" ? settled.detail : undefined;
+  const detailText =
+    typeof detail === "string"
+      ? detail
+      : detail !== undefined
+        ? JSON.stringify(detail)
+        : "";
+  return {
+    reason,
+    message: detailText
+      ? `Submission unanswered (${reason}): ${detailText}`
+      : `Submission unanswered (${reason})`,
+    ...(detail !== undefined ? { detail } : {}),
+  };
 }
 
 function assistantText(message: AssistantMessage | undefined): string {
@@ -139,9 +177,28 @@ export class PiRuntime {
       options.sessionId,
     );
     const models = createModels();
+    let bedrockAuthSource: string | undefined;
 
     if (modelMode === "bedrock") {
-      models.setProvider(amazonBedrockProvider());
+      const { region, modelId } = applyBedrockRuntimeEnv();
+      const provider = createConfiguredAmazonBedrockProvider();
+      models.setProvider(provider);
+      const configured = models.getModel("amazon-bedrock", modelId);
+      if (!configured) {
+        throw new Error(
+          `Bedrock model ${modelId} is not registered on amazon-bedrock`,
+        );
+      }
+      const auth = await models.getAuth(configured);
+      bedrockAuthSource = auth?.source;
+      if (!auth) {
+        throw new Error(
+          `amazon-bedrock provider is not configured (region=${region} model=${modelId})`,
+        );
+      }
+      process.stdout.write(
+        `BEDROCK_PROVIDER configured source=${auth.source} model=${modelId} region=${region}\n`,
+      );
     } else {
       const faux = fauxProvider({ tokensPerSecond: 10_000 });
       faux.setResponses(Array.from({ length: 100 }, () => scriptedResponse));
@@ -164,6 +221,7 @@ export class PiRuntime {
           pid: process.pid,
           label,
         };
+        process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
         await appendFile(attemptsPath, `${JSON.stringify(attempt)}\n`, "utf8");
         await recorder.record("tool_call_started", {
           name: "durable_wait",
@@ -212,9 +270,7 @@ export class PiRuntime {
       modelMode === "bedrock"
         ? {
             provider: "amazon-bedrock",
-            modelId:
-              process.env.BEDROCK_MODEL_ID ??
-              "global.anthropic.claude-sonnet-4-6",
+            modelId: applyBedrockRuntimeEnv().modelId,
           }
         : { provider: "faux", modelId: "faux-1" };
     const root = await harness.root(context, { agent: { model } });
@@ -232,6 +288,9 @@ export class PiRuntime {
       modelMode,
       storage: opened.backend,
       location: opened.location,
+      ...(bedrockAuthSource !== undefined
+        ? { bedrockAuthSource }
+        : {}),
     });
     await recorder.record("conversation_snapshot", events.snapshot);
     events.start(async (batch) => {
@@ -266,8 +325,21 @@ export class PiRuntime {
         context,
       );
       const settled = await submission.wait(context);
-      if (settled.status !== "done" || settled.type !== "input") {
-        throw new Error(`Submission did not complete: ${settled.status}`);
+      if (settled.status === "unanswered" || settled.type !== "input") {
+        const payload = unansweredPayload(settled);
+        await this.recorder.record("invocation_failed", {
+          requestId,
+          reason: payload.reason,
+          detail: payload.detail ?? null,
+        });
+        return {
+          response: payload.message,
+          requestId,
+          sessionId: this.sessionId,
+          status: "error",
+          reason: payload.reason,
+          ...(payload.detail !== undefined ? { detail: payload.detail } : {}),
+        };
       }
       const answer = await this.root.commit(
         (transaction) => transaction.entry(AssistantEntry, settled.answer),
@@ -280,7 +352,12 @@ export class PiRuntime {
         requestId,
         response,
       });
-      return { response, requestId, sessionId: this.sessionId };
+      return {
+        response,
+        requestId,
+        sessionId: this.sessionId,
+        status: "success",
+      };
     } finally {
       this.#busy--;
     }

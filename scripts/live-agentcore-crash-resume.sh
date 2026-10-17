@@ -91,34 +91,62 @@ invoke() {
 
 dump_cloudwatch() {
   echo "=== CloudWatch runtime logs ===" | tee -a "$log_dir/summary.log"
+  sleep 12
   set +e
   aws logs describe-log-groups \
     --region "$AWS_REGION" \
-    --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/" \
+    --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/${runtime_id}" \
     --output json >"$log_dir/cw-log-groups.json" 2>"$log_dir/cw-describe.err"
   python3 - <<PY
-import json, subprocess, os, sys
+import json, subprocess, os
 from pathlib import Path
 region = os.environ["AWS_REGION"]
 log_dir = Path("$log_dir")
 rid = "$runtime_id"
-groups = []
+data = {}
 try:
     data = json.loads((log_dir / "cw-log-groups.json").read_text() or "{}")
-    groups = [g.get("logGroupName","") for g in data.get("logGroups", [])]
 except Exception as exc:
     (log_dir / "cw-parse.err").write_text(str(exc))
-matched = [g for g in groups if rid in g or "pi_durable_agentcore" in g] or groups
+groups = [g.get("logGroupName","") for g in data.get("logGroups", [])]
+matched = [g for g in groups if rid in g] or groups
 (log_dir / "cw-matched-groups.txt").write_text("\n".join(matched) + ("\n" if matched else ""))
 print("cw_groups=" + ",".join(matched) if matched else "cw_groups=(none)")
-for i, name in enumerate(matched[:4]):
-    out = log_dir / f"cw-events-{i}.json"
+for i, name in enumerate(matched[:3]):
+    streams_out = log_dir / f"cw-streams-{i}.json"
     subprocess.run(
-        ["aws", "logs", "filter-log-events", "--region", region,
-         "--log-group-name", name, "--limit", "100", "--output", "json"],
-        stdout=out.open("w"), stderr=(log_dir / "cw-filter.err").open("a"),
+        ["aws", "logs", "describe-log-streams", "--region", region,
+         "--log-group-name", name, "--order-by", "LastEventTime",
+         "--descending", "--limit", "10", "--output", "json"],
+        stdout=streams_out.open("w"), stderr=(log_dir / "cw-streams.err").open("a"),
         check=False,
     )
+    try:
+        streams = json.loads(streams_out.read_text() or "{}").get("logStreams", [])
+    except Exception:
+        streams = []
+    (log_dir / f"cw-stream-names-{i}.txt").write_text(
+        "\n".join(s.get("logStreamName","") for s in streams) + "\n"
+    )
+    subprocess.run(
+        ["aws", "logs", "filter-log-events", "--region", region,
+         "--log-group-name", name, "--limit", "200", "--output", "json"],
+        stdout=(log_dir / f"cw-events-{i}.json").open("w"),
+        stderr=(log_dir / "cw-filter.err").open("a"),
+        check=False,
+    )
+    for j, stream in enumerate(streams[:5]):
+        sn = stream.get("logStreamName")
+        if not sn:
+            continue
+        subprocess.run(
+            ["aws", "logs", "get-log-events", "--region", region,
+             "--log-group-name", name, "--log-stream-name", sn,
+             "--limit", "100", "--start-from-head", "--output", "json"],
+            stdout=(log_dir / f"cw-get-{i}-{j}.json").open("w"),
+            stderr=(log_dir / "cw-get.err").open("a"),
+            check=False,
+        )
 PY
   set -e
 }
@@ -187,6 +215,49 @@ if [[ "$invoke2_status" -ne 0 ]]; then
   echo "FAIL replacement invoke" | tee -a "$log_dir/summary.log"
   exit 1
 fi
+
+python3 - <<PY
+import json, re, sys
+from pathlib import Path
+log_dir = Path("$log_dir")
+text = (log_dir / "invoke-2-response.txt").read_text() if (log_dir / "invoke-2-response.txt").exists() else ""
+# AgentCore may wrap the container JSON; find the innermost object.
+match = re.search(r"\{.*\}", text, re.S)
+if not match:
+    print("FAIL invoke-2 body is not JSON")
+    sys.exit(1)
+body = json.loads(match.group(0))
+(log_dir / "invoke-2-parsed.json").write_text(json.dumps(body, indent=2))
+status = body.get("status")
+reason = body.get("reason")
+response = body.get("response") or ""
+print(f"invoke_2_payload_status={status}")
+print(f"invoke_2_payload_reason={reason}")
+if status != "success":
+    print(f"FAIL replacement invoke payload status={status} reason={reason} response={response[:500]}")
+    sys.exit(1)
+if "Provider is not configured" in response or "unanswered" in response:
+    print(f"FAIL replacement invoke still shows model/config error: {response[:500]}")
+    sys.exit(1)
+seen = set()
+for path in sorted(log_dir.glob("cw-*.json")):
+    try:
+        data = json.loads(path.read_text() or "{}")
+    except Exception:
+        continue
+    events = data.get("events") or []
+    for event in events:
+        msg = event.get("message") or ""
+        for match in re.finditer(r"TOOL_ATTEMPT (\{.*\})", msg):
+            seen.add(match.group(1))
+attempts = len(seen)
+print(f"tool_attempts_in_cloudwatch={attempts}")
+(log_dir / "tool-attempts-count.txt").write_text("\n".join(sorted(seen)) + ("\n" if seen else ""))
+if attempts < 2:
+    print(f"FAIL expected >=2 unique TOOL_ATTEMPT log lines, got {attempts}")
+    sys.exit(1)
+print("PASS invoke-2 success with tool attempts")
+PY
 
 echo "PASS live crash->resume session=${session_id}" | tee -a "$log_dir/summary.log"
 echo "Logs in ${log_dir}"

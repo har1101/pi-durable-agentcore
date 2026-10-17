@@ -102,7 +102,7 @@ const server = createServer(async (request, response) => {
           ? { requestId: input.requestId }
           : {}),
       });
-      json(response, 200, { ...result, status: "success" });
+      json(response, 200, result);
       return;
     }
 
@@ -131,10 +131,13 @@ const server = createServer(async (request, response) => {
     response.setHeader("x-amzn-ErrorType", "ResourceNotFoundException");
     json(response, 404, { message: "Not found" });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : undefined;
+    process.stderr.write(
+      `RuntimeClientError ${request.method} ${url.pathname}: ${message}\n${stack ?? ""}\n`,
+    );
     response.setHeader("x-amzn-ErrorType", "RuntimeClientError");
-    json(response, 500, {
-      message: error instanceof Error ? error.message : String(error),
-    });
+    json(response, 500, { message });
   }
 });
 
