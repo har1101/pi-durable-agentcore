@@ -38,7 +38,9 @@ curl 'http://localhost:8080/events?sessionId=local-demo'
 ```
 
 `/events` lists model/tool events and monotonically numbered observed commit
-positions. `/ping` returns `HealthyBusy` while work is running.
+positions. With `STORAGE_BACKEND=dynamodb` it reads the durable event log from
+DynamoDB (no lease, any process); `/status` shows the session's wake-up item
+and approvals. `/ping` returns `HealthyBusy` while work is running.
 
 ## Real crash → resume demo
 
@@ -64,6 +66,90 @@ PASS crash->resume: attempts=2
 The integration suite exercises this same process boundary; it does not mock
 Pi Durable or DynamoDB.
 
+## Human approval, timed waits, and automatic resume
+
+All of this needs `STORAGE_BACKEND=dynamodb`. Everything a later process needs
+lives in the session table, so a session can continue on a new microVM, after
+the 8 h AgentCore lifetime, or after a crash.
+
+| Item (same table)          | Partition key               | Purpose                                                    |
+| -------------------------- | --------------------------- | ---------------------------------------------------------- |
+| Pi commit log, lease, meta | `s#<sha256(session)>`       | unchanged                                                  |
+| Event log (`/events`)      | `s#<sha256(session)>#events`| `EVT#<position>` + atomic counter `EVTSEQ`                 |
+| Control                    | `s#<sha256(session)>#ctl`   | `APPROVAL#<id>`, one `WAKE` item, `EFFECT#<idempotency key>` |
+
+Separate partitions keep Pi recovery from reading events or control items.
+
+### Human in the loop (`guarded_action`)
+
+The tool records a pending approval and the session's wake-up item, then the
+runtime closes the Harness (the replay-safe tool task stays at its durable
+`execute` checkpoint) and releases the lease. The invocation returns:
+
+```json
+{"status":"pending_approval","requestId":"r1","approval":{"approvalId":"…","toolName":"guarded_action","deadline":"…"}}
+```
+
+While it is pending, new prompts get the same pending result
+(`reason: "session_suspended"`). An approver answers on the same AgentCore
+session id:
+
+```json
+{"approval":{"approvalId":"…","decision":"approve","approverToken":"<hex>","reason":"optional"}}
+```
+
+- `decision` must be exactly `"approve"` or `"reject"`; anything else is a 400
+  and nothing is recorded. Only `"approve"` approves.
+- `approverToken` is `HMAC-SHA256(APPROVAL_HMAC_KEY, "pi-durable-agentcore/approval/v1\0" + sessionId + "\0" + approvalId)`
+  in hex. Only the approver service holds the key; the requester gets the
+  approval id only. Without `APPROVAL_HMAC_KEY` every decision is refused (403)
+  and approvals can only time out.
+- The decision is a conditional write (pending and before the deadline), then
+  the session resumes from DynamoDB: Pi reruns only the parked tool, which
+  finds the decision and performs the action once (`EFFECT#<key>`). Completed
+  model calls and tools are not repeated.
+- After `PI_APPROVAL_TIMEOUT_MS` (default 24 h) the approval is rejected
+  automatically and the run continues with the rejection.
+
+### Timed waits (`wait_until`)
+
+`wait_until({seconds})` memoizes the resume time in Pi, arms the wake-up item
+for it, and suspends like an approval (`status: "waiting"`, `resumeAt`).
+
+### Tool idempotency keys
+
+Every tool execution gets `tk_<sha256(domain, sessionId, conversationId, Pi tool task id)>`
+(`src/idempotency.ts`). The task id is minted durably when the call is
+admitted, so the key is stable across retries, replays, and resume on another
+microVM, and differs per tool use even when a provider reuses a tool call id.
+The raw session id never appears in it.
+
+### Automatic resume (no client request)
+
+One `WAKE` item per session, indexed by the sparse `WakeIndex` GSI
+(`wakeShard`, `wakeDueAt`) while armed:
+
+| Situation              | Armed by                                  | Due at                                 |
+| ---------------------- | ----------------------------------------- | -------------------------------------- |
+| Run in flight          | runtime heartbeat (`PI_WAKE_HEARTBEAT_MS`) | now + `PI_WAKE_CRASH_GRACE_MS` (60 s)  |
+| Waiting for a human    | `guarded_action`                          | approval deadline (auto-reject)        |
+| Timed wait             | `wait_until`                              | resume time                            |
+| Idle                   | disarmed when the run settles             | –                                      |
+
+A Lambda run every minute by EventBridge Scheduler (`infra/github-oidc-bootstrap.yaml`,
+`AutoResume*`) queries due items, claims each with a conditional write on the
+due time it read (racing sweeps claim once; the claim also schedules a retry
+after `AutoResumeRetrySeconds`), and calls `InvokeAgentRuntime` with the same
+`runtimeSessionId` and `{"action":"resume"}`. The runtime answers at once and
+continues in the background (`/ping` reports `HealthyBusy`); a second resumer
+on another process gets 409 from the DynamoDB lease. A wake claimed
+`AutoResumeMaxAttempts` times without progress is dead-lettered
+(`deadLetter=true`, out of the index). Clients may send
+`{"action":"resume","wait":true}` themselves.
+
+The local tests run the template's exact Lambda source against DynamoDB Local,
+with local servers standing in for `InvokeAgentRuntime`.
+
 ## AWS bootstrap UPDATE (do not create a new stack)
 
 The account already has `pi-durable-agentcore-bootstrap` in `CREATE_COMPLETE`.
@@ -72,7 +158,8 @@ Do **not** run `create-stack`. Fukuchi updates that stack with
 `UsePreviousValue=true` so CloudFormation does not recreate the OIDC provider.
 
 The 918f7b8 template diff and the same command live in
-`docs/bootstrap-update.md`.
+`docs/bootstrap-update.md`. The auto-resume update (WakeIndex GSI + sweeper,
+new parameters) is the last section there.
 
 ```bash
 aws cloudformation update-stack \
@@ -109,6 +196,9 @@ environment variables:
 | `AWS_REGION`                   | bootstrap Region                                           |
 | `AGENT_RUNTIME_NAME`           | optional; defaults to `pi_durable_agentcore`               |
 | `BEDROCK_MODEL_ID`             | optional; defaults to `global.anthropic.claude-sonnet-4-6` |
+| `PI_WAKE_SHARDS`               | optional; must equal `WakeShardCount` (default 4)          |
+| `PI_APPROVAL_TIMEOUT_MS`       | optional; approval auto-reject deadline (default 24 h)     |
+| secret `APPROVAL_HMAC_KEY`     | optional; enables approver decisions (≥ 16 chars)          |
 
 The workflow `.github/workflows/deploy-agentcore.yml` assumes the OIDC role,
 tests against DynamoDB Local, builds an ARM64 image, pushes it, and creates or
@@ -118,7 +208,8 @@ scripted + DynamoDB Local, preventing accidental paid model calls.
 
 ## Persistence
 
-Each session is one DynamoDB partition. A conditional-write lease plus a
+Each session's Pi state is one DynamoDB partition (its event log and control
+items have their own, see above). A conditional-write lease plus a
 monotonic fencing token enforces Pi's single-writer rule. Commits are
 idempotent and chunked under DynamoDB's 400 KB item limit. A replaced AgentCore
 microVM reopens the same table, steals an expired lease, and calls `resume()`.

@@ -229,3 +229,105 @@ aws cloudformation update-stack \
     ParameterKey=EcrRepositoryName,UsePreviousValue=true \
     ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
 ```
+
+## Exact UPDATE command (auto-resume: WakeIndex GSI + sweeper)
+
+What changes, all in place:
+
+- `SessionStore` gains two attribute definitions (`wakeShard` S, `wakeDueAt` N)
+  and one GSI `WakeIndex`. Adding a GSI is an `UpdateTable`
+  (`Replacement: False`); the table keeps its name, data, and
+  `DeletionPolicy: Retain`. Only one GSI is added per update, as DynamoDB
+  requires.
+- New resources, created only when `AutoResumeAgentRuntimeArn` is not empty:
+  `AutoResumeFunctionRole`, `AutoResumeLogGroup`, `AutoResumeFunction`
+  (nodejs22.x arm64, inline), `AutoResumeScheduleRole`, `AutoResumeSchedule`
+  (EventBridge Scheduler). New roles only; existing roles are untouched.
+- No change to the OIDC provider, `GitHubDeployRole`,
+  `AgentRuntimeExecutionRole` (the runtime only uses Get/Put/Update/Query,
+  already allowed on the table), or ECR.
+
+New parameters (defaults apply when omitted):
+
+| Parameter                      | Default          | Meaning                                                          |
+| ------------------------------ | ---------------- | ---------------------------------------------------------------- |
+| `AutoResumeAgentRuntimeArn`    | `""`             | Runtime the sweeper invokes; empty = GSI only, no sweeper        |
+| `AutoResumeScheduleExpression` | `rate(1 minute)` | Sweep cadence (deadline/timer granularity)                       |
+| `WakeShardCount`               | `4`              | WakeIndex shards; must equal the runtime's `PI_WAKE_SHARDS`       |
+| `AutoResumeRetrySeconds`       | `120`            | Delay before a claimed wake is offered again                     |
+| `AutoResumeMaxAttempts`        | `10`             | Claims without progress before a wake is dead-lettered           |
+
+New outputs: `WakeIndexName`, and with the sweeper `AutoResumeFunctionArn`,
+`AutoResumeScheduleArn`. Existing outputs are unchanged.
+
+Find the runtime ARN (the workflow prints `AGENT_RUNTIME_ARN=` too):
+
+```bash
+aws bedrock-agentcore-control list-agent-runtimes \
+  --profile fukuchi --region ap-northeast-1 \
+  --query "agentRuntimes[?agentRuntimeName=='pi_durable_agentcore'].agentRuntimeArn | [0]" \
+  --output text
+```
+
+Preview first and confirm `SessionStore` shows `Modify` with
+`Replacement: False` and no other existing resource is replaced:
+
+```bash
+aws cloudformation create-change-set \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --change-set-name auto-resume \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true \
+    ParameterKey=AutoResumeAgentRuntimeArn,ParameterValue=<runtime ARN from above> \
+    ParameterKey=WakeShardCount,ParameterValue=4
+aws cloudformation describe-change-set \
+  --profile fukuchi --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap --change-set-name auto-resume \
+  --query 'Changes[].ResourceChange.[Action,LogicalResourceId,Replacement]' --output table
+```
+
+Then either execute that change set or run the update directly:
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true \
+    ParameterKey=AutoResumeAgentRuntimeArn,ParameterValue=<runtime ARN from above> \
+    ParameterKey=WakeShardCount,ParameterValue=4
+```
+
+On later updates pass the five new parameters with `UsePreviousValue=true` as
+well. Order does not matter: the new runtime image writes the wake attributes
+whether or not the GSI exists yet, and the sweeper only reads the GSI.
+
+Runtime settings that go with it (GitHub `agentcore-poc` environment):
+variable `PI_WAKE_SHARDS` (= `WakeShardCount`), optional variable
+`PI_APPROVAL_TIMEOUT_MS`, optional secret `APPROVAL_HMAC_KEY` (approver
+decisions are refused without it). Configure the runtime's lifecycle
+(`idleRuntimeSessionTimeout`, `maxLifetime`) up to 28,800 s; nothing here
+depends on a session outliving them.
+
+Do not run AWS from this agent environment.
