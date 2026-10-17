@@ -13,7 +13,30 @@ image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITOR
 artifact="{\"containerConfiguration\":{\"containerUri\":\"${image_uri}\"}}"
 table_name="${DYNAMODB_TABLE:-pi-durable-agentcore-sessions}"
 delay_ms="${SCRIPTED_TOOL_DELAY_MS:-20000}"
-environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\",\"SCRIPTED_TOOL_DELAY_MS\":\"${delay_ms}\"}"
+# PI_WAKE_SHARDS must equal the bootstrap stack's WakeShardCount (auto-resume).
+# APPROVAL_HMAC_KEY (optional GitHub secret) enables approver decisions; without
+# it every approval decision is refused and pending approvals auto-reject at
+# their deadline.
+environment="$(python3 - "$model_id" "$table_name" "$delay_ms" <<'PY'
+import json, os, sys
+model_id, table_name, delay_ms = sys.argv[1:4]
+env = {
+    "MODEL_PROVIDER": "bedrock",
+    "BEDROCK_MODEL_ID": model_id,
+    "STATE_DIRECTORY": "/tmp/pi-durable-agentcore",
+    "STORAGE_BACKEND": "dynamodb",
+    "DYNAMODB_TABLE": table_name,
+    "AWS_REGION": os.environ["AWS_REGION"],
+    "PI_SESSION_LEASE_TTL_MS": os.environ.get("PI_SESSION_LEASE_TTL_MS") or "15000",
+    "SCRIPTED_TOOL_DELAY_MS": delay_ms,
+    "PI_WAKE_SHARDS": os.environ.get("PI_WAKE_SHARDS") or "4",
+    "PI_APPROVAL_TIMEOUT_MS": os.environ.get("PI_APPROVAL_TIMEOUT_MS") or "86400000",
+}
+if os.environ.get("APPROVAL_HMAC_KEY"):
+    env["APPROVAL_HMAC_KEY"] = os.environ["APPROVAL_HMAC_KEY"]
+print(json.dumps(env, separators=(",", ":")))
+PY
+)"
 
 runtime_id="${AGENT_RUNTIME_ID:-}"
 if [[ -z "$runtime_id" ]]; then

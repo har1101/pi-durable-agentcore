@@ -32,9 +32,34 @@ Parameters:
     Type: String
     Default: repo:har1101@174846912/pi-durable-agentcore@1422425297
     Description: Immutable GitHub Actions OIDC sub prefix (repo:ownerId/repoId) when use_immutable_subject is true
+  AutoResumeAgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: AgentCore runtime ARN the auto-resume sweeper invokes; empty creates no sweeper resources
+  AutoResumeScheduleExpression:
+    Type: String
+    Default: rate(1 minute)
+    Description: EventBridge Scheduler expression for the auto-resume sweep (deadline/timer granularity)
+  WakeShardCount:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 64
+    Description: WakeIndex shards; must equal PI_WAKE_SHARDS on the AgentCore runtime
+  AutoResumeRetrySeconds:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    Description: Seconds before a claimed wake is offered again when the resume did not take over
+  AutoResumeMaxAttempts:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Claims of one wake without progress before it is dead-lettered (deadLetter=true)
 
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
+  CreateAutoResume: !Not [!Equals [!Ref AutoResumeAgentRuntimeArn, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -79,11 +104,26 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
+        - AttributeName: wakeShard
+          AttributeType: S
+        - AttributeName: wakeDueAt
+          AttributeType: N
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      # Sparse: only armed wake-up items (s#<sha256>#ctl / WAKE) carry these
+      # attributes. Adding a GSI is an in-place UpdateTable, not a replacement.
+      GlobalSecondaryIndexes:
+        - IndexName: WakeIndex
+          KeySchema:
+            - AttributeName: wakeShard
+              KeyType: HASH
+            - AttributeName: wakeDueAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   AgentRuntimeExecutionRole:
     Type: AWS::IAM::Role
@@ -308,6 +348,210 @@ Resources:
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:*
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*
 
+  AutoResumeFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateAutoResume
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SweepWakeItems
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: QueryDueWakes
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub ${SessionStore.Arn}/index/WakeIndex
+              - Sid: ClaimOnlyControlItems
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt SessionStore.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - s#*#ctl
+        - PolicyName: ResumeThisAgentRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref AutoResumeAgentRuntimeArn
+                  - !Sub ${AutoResumeAgentRuntimeArn}/runtime-endpoint/*
+        - PolicyName: WriteOwnLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/pi-durable-agentcore-auto-resume:*
+
+  AutoResumeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateAutoResume
+    Properties:
+      LogGroupName: /aws/lambda/pi-durable-agentcore-auto-resume
+      RetentionInDays: 30
+
+  # Inline source; test/auto-resume.integration.test.ts runs this exact code
+  # against DynamoDB Local. Uses the AWS SDK v3 bundled in nodejs22.x.
+  AutoResumeFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateAutoResume
+    DependsOn: AutoResumeLogGroup
+    Properties:
+      FunctionName: pi-durable-agentcore-auto-resume
+      Description: Resumes Pi Durable AgentCore sessions whose wake-up is due (crash, approval timeout, timer)
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 50
+      Role: !GetAtt AutoResumeFunctionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SessionStore
+          WAKE_SHARDS: !Ref WakeShardCount
+          RETRY_SECONDS: !Ref AutoResumeRetrySeconds
+          MAX_ATTEMPTS: !Ref AutoResumeMaxAttempts
+          AGENT_RUNTIME_ARN: !Ref AutoResumeAgentRuntimeArn
+          QUALIFIER: DEFAULT
+      Code:
+        ZipFile: |
+          // Auto-resume sweeper. Every run: find armed, due wake items (WakeIndex GSI),
+          // claim each with a conditional write on the due time it saw (so racing
+          // sweeps claim it once; the claim also schedules the retry), then call
+          // InvokeAgentRuntime with the same runtimeSessionId and {"action":"resume"}.
+          const { DynamoDBClient, QueryCommand, UpdateItemCommand } = require("@aws-sdk/client-dynamodb");
+          const E = process.env;
+          const num = (v, d) => (Number(v) > 0 ? Number(v) : d);
+          const N = (v) => ({ N: String(v) });
+
+          async function sweep(o) {
+            const table = o.table ?? E.TABLE_NAME;
+            const shards = o.shards ?? num(E.WAKE_SHARDS, 4);
+            const retryMs = o.retryMs ?? num(E.RETRY_SECONDS, 120) * 1000;
+            const maxAttempts = o.maxAttempts ?? num(E.MAX_ATTEMPTS, 10);
+            const now = o.now ?? Date.now();
+            const out = { due: 0, claimed: 0, invoked: 0, failed: 0, dead: 0 };
+            for (let s = 0; s < shards; s++) {
+              const page = await o.ddb.send(new QueryCommand({
+                TableName: table,
+                IndexName: "WakeIndex",
+                KeyConditionExpression: "wakeShard = :s AND wakeDueAt <= :n",
+                ExpressionAttributeValues: { ":s": { S: `wake#${s}` }, ":n": N(now) },
+                Limit: 25,
+              }));
+              for (const it of page.Items ?? []) {
+                out.due++;
+                const attempts = Number(it.attempts?.N ?? 0) + 1;
+                const dead = attempts > maxAttempts;
+                try {
+                  await o.ddb.send(new UpdateItemCommand({
+                    TableName: table,
+                    Key: { pk: it.pk, sk: it.sk },
+                    ConditionExpression: "wakeDueAt = :seen",
+                    UpdateExpression: dead
+                      ? "SET deadLetter = :t, attempts = :a REMOVE wakeShard, wakeDueAt"
+                      : "SET wakeDueAt = :next, attempts = :a",
+                    ExpressionAttributeValues: dead
+                      ? { ":seen": it.wakeDueAt, ":a": N(attempts), ":t": { BOOL: true } }
+                      : { ":seen": it.wakeDueAt, ":a": N(attempts), ":next": N(now + retryMs) },
+                  }));
+                } catch (e) {
+                  if (e.name === "ConditionalCheckFailedException") continue;
+                  throw e;
+                }
+                if (dead) {
+                  out.dead++;
+                  console.error("WAKE_DEAD_LETTER", it.pk.S);
+                  continue;
+                }
+                out.claimed++;
+                try {
+                  await o.invoke(it.sessionId.S, { action: "resume", reason: it.reason?.S });
+                  out.invoked++;
+                } catch (e) {
+                  out.failed++;
+                  console.error("RESUME_INVOKE_FAILED", it.pk.S, e.name, e.message);
+                }
+              }
+            }
+            console.log("SWEEP", JSON.stringify(out));
+            return out;
+          }
+
+          let clients;
+          exports.sweep = sweep;
+          exports.handler = async () => {
+            if (!clients) {
+              const ac = require("@aws-sdk/client-bedrock-agentcore");
+              clients = { ddb: new DynamoDBClient({}), ac: new ac.BedrockAgentCoreClient({}), Cmd: ac.InvokeAgentRuntimeCommand };
+            }
+            return sweep({
+              ddb: clients.ddb,
+              invoke: async (sessionId, payload) => {
+                const r = await clients.ac.send(new clients.Cmd({
+                  agentRuntimeArn: E.AGENT_RUNTIME_ARN,
+                  qualifier: E.QUALIFIER || "DEFAULT",
+                  runtimeSessionId: sessionId,
+                  contentType: "application/json",
+                  accept: "application/json",
+                  payload: Buffer.from(JSON.stringify(payload)),
+                }));
+                await r.response?.transformToString?.();
+              },
+            });
+          };
+
+  AutoResumeScheduleRole:
+    Type: AWS::IAM::Role
+    Condition: CreateAutoResume
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeAutoResumeFunction
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AutoResumeFunction.Arn
+
+  AutoResumeSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateAutoResume
+    Properties:
+      Description: Sweep due Pi Durable wake-ups and resume their AgentCore sessions
+      ScheduleExpression: !Ref AutoResumeScheduleExpression
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt AutoResumeFunction.Arn
+        RoleArn: !GetAtt AutoResumeScheduleRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
 Outputs:
   GitHubDeployRoleArn:
     Value: !GetAtt GitHubDeployRole.Arn
@@ -321,3 +565,11 @@ Outputs:
     Value: !Ref SessionStore
   SessionTableArn:
     Value: !GetAtt SessionStore.Arn
+  WakeIndexName:
+    Value: WakeIndex
+  AutoResumeFunctionArn:
+    Condition: CreateAutoResume
+    Value: !GetAtt AutoResumeFunction.Arn
+  AutoResumeScheduleArn:
+    Condition: CreateAutoResume
+    Value: !GetAtt AutoResumeSchedule.Arn
