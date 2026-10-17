@@ -56,6 +56,41 @@ data = json.loads(Path("/tmp/agentcore-runtime.json").read_text())
 runtime = data.get("agentRuntime") or data
 rid = runtime.get("agentRuntimeId") or data.get("agentRuntimeId") or ""
 arn = runtime.get("agentRuntimeArn") or data.get("agentRuntimeArn") or ""
+Path("/tmp/agentcore-runtime-id").write_text(rid)
 print(f"AGENT_RUNTIME_ID={rid}")
 print(f"AGENT_RUNTIME_ARN={arn}")
 PY
+
+runtime_id="$(cat /tmp/agentcore-runtime-id)"
+if [[ -z "$runtime_id" ]]; then
+  echo "create/update returned no agentRuntimeId" >&2
+  exit 1
+fi
+
+echo "Waiting for DEFAULT endpoint to become READY..."
+for _ in $(seq 1 40); do
+  endpoint_json="$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
+    --region "$AWS_REGION" \
+    --agent-runtime-id "$runtime_id" \
+    --endpoint-name DEFAULT \
+    --output json 2>/tmp/agentcore-endpoint.err || true)"
+  if [[ -n "$endpoint_json" ]]; then
+    status="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); e=d.get("agentRuntimeEndpoint") or d; print(e.get("status") or e.get("endpointStatus") or "")' "$endpoint_json")"
+    echo "endpoint_status=${status}"
+    if [[ "$status" == "READY" ]]; then
+      break
+    fi
+    if [[ "$status" == "CREATE_FAILED" || "$status" == "UPDATE_FAILED" ]]; then
+      echo "$endpoint_json"
+      exit 1
+    fi
+  else
+    cat /tmp/agentcore-endpoint.err || true
+  fi
+  sleep 15
+done
+status="${status:-}"
+if [[ "$status" != "READY" ]]; then
+  echo "DEFAULT endpoint did not become READY" >&2
+  exit 1
+fi

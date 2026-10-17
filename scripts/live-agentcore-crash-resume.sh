@@ -46,6 +46,36 @@ echo "RUNTIME_SESSION_ID=${session_id}" | tee -a "$log_dir/runtime-ids.txt"
 echo "REQUEST_ID=${request_id}" | tee -a "$log_dir/runtime-ids.txt"
 printf '%s\n' "$payload" >"$log_dir/payload.json"
 
+echo "Waiting for DEFAULT endpoint READY before invoke..." | tee -a "$log_dir/summary.log"
+ready=""
+for _ in $(seq 1 40); do
+  endpoint_json="$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
+    --region "$AWS_REGION" \
+    --agent-runtime-id "$runtime_id" \
+    --endpoint-name DEFAULT \
+    --output json 2>"$log_dir/endpoint-wait.err" || true)"
+  if [[ -n "$endpoint_json" ]]; then
+    printf '%s\n' "$endpoint_json" >"$log_dir/endpoint.json"
+    status="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); e=d.get("agentRuntimeEndpoint") or d; print(e.get("status") or e.get("endpointStatus") or "")' "$endpoint_json")"
+    echo "endpoint_status=${status}" | tee -a "$log_dir/summary.log"
+    if [[ "$status" == "READY" ]]; then
+      ready=1
+      break
+    fi
+    if [[ "$status" == "CREATE_FAILED" || "$status" == "UPDATE_FAILED" ]]; then
+      echo "endpoint failed: ${status}" | tee -a "$log_dir/summary.log"
+      exit 1
+    fi
+  else
+    cat "$log_dir/endpoint-wait.err" | tee -a "$log_dir/summary.log" || true
+  fi
+  sleep 15
+done
+if [[ -z "$ready" ]]; then
+  echo "DEFAULT endpoint did not become READY" | tee -a "$log_dir/summary.log"
+  exit 1
+fi
+
 invoke() {
   local out="$1"
   aws bedrock-agentcore invoke-agent-runtime \
