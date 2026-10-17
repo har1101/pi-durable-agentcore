@@ -193,22 +193,29 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestTag/Project: pi-durable-agentcore
-              - Sid: ManageRuntimeEndpoints
+              - Sid: ManageRuntimeEndpointsAndVersions
                 Effect: Allow
                 Action:
                   - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                  - bedrock-agentcore:CreateAgentRuntimeVersion
                   - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:GetAgentRuntimeVersion
                   - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:ListAgentRuntimeVersions
                   - bedrock-agentcore:UpdateAgentRuntimeEndpoint
                 Resource:
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-endpoint/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-version/*
               - Sid: TagThisRuntime
                 Effect: Allow
                 Action:
                   - bedrock-agentcore:TagResource
                   - bedrock-agentcore:ListTagsForResource
-                Resource: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-endpoint/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-version/*
               - Sid: UpdateTaggedRuntime
                 Effect: Allow
                 Action:

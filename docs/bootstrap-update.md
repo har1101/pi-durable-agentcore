@@ -112,9 +112,11 @@ GHA run 39000719319 pushed the ARM64 image, then CreateAgentRuntime failed:
 on `arn:aws:bedrock-agentcore:ap-northeast-1:064212132988:runtime/*`.
 
 One in-place policy add covers the rest of this deploy+invoke path so we
-do not dribble: Create/Get/List/UpdateAgentRuntimeEndpoint, TagResource,
-ListTagsForResource, InvokeAgentRuntimeForUser. Do **not** replace OIDC,
-roles, ECR, or DynamoDB. Every parameter keeps its previous value.
+do not dribble: Create/Get/List/UpdateAgentRuntimeEndpoint,
+Create/Get/ListAgentRuntimeVersion, TagResource, ListTagsForResource,
+InvokeAgentRuntimeForUser. Existing List/Create/Get/Update/Invoke/Stop/PassRole
+stay. Do **not** replace OIDC, roles, ECR, or DynamoDB. Every parameter
+keeps its previous value.
 
 ```bash
 aws cloudformation update-stack \
