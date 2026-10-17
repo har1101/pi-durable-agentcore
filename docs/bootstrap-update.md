@@ -100,6 +100,10 @@ manifest/attestations: `ecr:BatchGetImage` is not on `GitHubDeployRole`.
 only; do **not** replace the OIDC provider, roles, ECR, or DynamoDB table.
 Every parameter keeps its previous value. Do not run AWS from this agent.
 
+Fukuchi applied this update: stack is **UPDATE_COMPLETE**. Re-run GitHub
+Actions `agentcore-poc` (push to main; workflow_dispatch is 403 for this
+token).
+
 ```bash
 aws cloudformation update-stack \
   --profile fukuchi \
