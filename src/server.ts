@@ -158,6 +158,10 @@ async function suspendedResult(
     wake.approvalId !== undefined
       ? await control.getApproval(wake.approvalId)
       : undefined;
+  // Decided, timed out, or due: opening the runtime resumes the parked tool
+  // first, and the prompt follows it.
+  if (approval !== undefined && approval.status !== "pending") return undefined;
+  if ((wake.dueAt ?? 0) <= Date.now()) return undefined;
   const result = pendingResult(id, requestId, {
     kind: wake.reason,
     dueAt: wake.dueAt ?? Date.now(),
@@ -248,6 +252,7 @@ async function handleDecision(
         : `The approval was already ${decided.record.status} by ${decided.record.decidedBy}`,
     );
   }
+  if (decided.outcome === "recorded") await control.expediteWake(Date.now());
   const runtime = await runtimeFor(id);
   const result = await runtime.resumeWork();
   return {

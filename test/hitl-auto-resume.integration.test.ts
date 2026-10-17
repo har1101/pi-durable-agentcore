@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ControlStore } from "../src/control-store.js";
 import {
   approverToken,
   autoResumeLambdaSource,
@@ -352,6 +353,54 @@ describe("automatic resume without a client request", () => {
     );
     expect(ofKind(await events(first, sessionId), "model_response")).toHaveLength(2);
   }, 60_000);
+});
+
+describe("stuck-state recovery", () => {
+  it("resumes via the sweeper when a recorded decision never resumed the run", async () => {
+    const sessionId = `decided-${randomUUID()}`;
+    const first = await server();
+    const pending = await invoke(first, sessionId, {
+      prompt: "[approval] Deploy the change.",
+      requestId: "decided-1",
+    });
+    const approvalId = (pending.body.approval as { approvalId: string }).approvalId;
+    await first.kill();
+    // The approver request recorded the decision and died before resuming.
+    const control = await ControlStore.open(sessionId);
+    expect((await control.decide(approvalId, "approve", { now: Date.now() })).outcome).toBe(
+      "recorded",
+    );
+    await control.expediteWake(Date.now());
+
+    const second = await server();
+    const calls: { sessionId: string; payload: unknown; status: number }[] = [];
+    await sweep((id) => (id === sessionId ? second : undefined), calls);
+    expect(calls).toHaveLength(1);
+    const done = await waitFor(
+      async () => completion(await events(second, sessionId), "decided-1")[0],
+      15_000,
+      "completion",
+    );
+    expect(done.detail.response).toContain("APPROVED and performed");
+  }, 60_000);
+
+  it("dead-letters a wake whose resume keeps failing", async () => {
+    const sessionId = `poison-${randomUUID()}`;
+    const control = await ControlStore.open(sessionId);
+    const start = Date.now();
+    await control.armWake({ reason: "running", dueAt: start - 1, fencingToken: 1 });
+    const route = (id: string) => (id === sessionId ? { url: "http://127.0.0.1:9" } : undefined);
+    const options = { retryMs: 1_000, maxAttempts: 2 };
+    await sweep(route, [], { ...options, now: start });
+    // A crash heartbeat from the resumed process re-arms but keeps the count.
+    await control.armWake({ reason: "running", dueAt: start + 500, fencingToken: 2 });
+    expect((await control.getWake()).attempts).toBe(1);
+    await sweep(route, [], { ...options, now: start + 1_000 });
+    expect((await control.getWake()).attempts).toBe(2);
+    await sweep(route, [], { ...options, now: start + 3_000 });
+    const wake = await control.getWake();
+    expect(wake).toMatchObject({ armed: false, deadLetter: true, attempts: 3 });
+  });
 });
 
 describe("tool idempotency keys", () => {

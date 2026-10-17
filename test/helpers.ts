@@ -181,6 +181,7 @@ type Sweep = (options: {
   table?: string;
   now?: number;
   retryMs?: number;
+  maxAttempts?: number;
 }) => Promise<SweepResult>;
 
 /** Load the Lambda module as CommonJS, as the nodejs22.x runtime would. */
@@ -205,6 +206,7 @@ let ddb: DynamoDBClient | undefined;
 export async function sweep(
   route: (sessionId: string) => { url: string } | undefined,
   calls: { sessionId: string; payload: unknown; status: number }[] = [],
+  options: { now?: number; retryMs?: number; maxAttempts?: number } = {},
 ): Promise<SweepResult> {
   ddb ??= new DynamoDBClient({
     endpoint: process.env.DYNAMODB_ENDPOINT,
@@ -213,6 +215,7 @@ export async function sweep(
   });
   const { sweep: run } = loadAutoResumeLambda();
   return run({
+    ...options,
     ddb,
     table: process.env.DYNAMODB_TABLE ?? "pi-durable-agentcore-sessions",
     invoke: async (sessionId, payload) => {

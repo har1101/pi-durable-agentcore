@@ -263,9 +263,14 @@ export class ControlStore {
     requestId?: string;
     approvalId?: string;
   }): Promise<boolean> {
+    // A crash heartbeat keeps the sweeper's claim count, so a run that kills
+    // its process every time is dead-lettered instead of resumed forever; a
+    // new suspension starts counting from zero.
+    const attempts =
+      options.reason === "running" ? "if_not_exists(attempts, :zero)" : ":zero";
     return this.#writeWake(
       "SET sessionId = :sid, wakeShard = :shard, wakeDueAt = :due, reason = :reason, " +
-        "fencingToken = :token, updatedAt = :now, attempts = :zero, requestId = :rid, approvalId = :aid " +
+        `fencingToken = :token, updatedAt = :now, attempts = ${attempts}, requestId = :rid, approvalId = :aid ` +
         "REMOVE deadLetter",
       {
         ":sid": this.sessionId,
@@ -283,10 +288,32 @@ export class ControlStore {
   /** Nothing left to resume: drop out of the sparse GSI. */
   async disarmWake(fencingToken: number): Promise<boolean> {
     return this.#writeWake(
-      "SET reason = :idle, fencingToken = :token, updatedAt = :now REMOVE wakeShard, wakeDueAt",
-      { ":idle": "idle" },
+      "SET reason = :idle, fencingToken = :token, updatedAt = :now, attempts = :zero " +
+        "REMOVE wakeShard, wakeDueAt",
+      { ":idle": "idle", ":zero": 0 },
       fencingToken,
     );
+  }
+
+  /**
+   * Make an armed wake due now (lease-free, for a recorded decision): if the
+   * request that recorded it dies before resuming, the sweeper resumes the
+   * session within one sweep instead of at the approval deadline.
+   */
+  async expediteWake(now: number): Promise<void> {
+    try {
+      await this.#docs.send(
+        new UpdateCommand({
+          TableName: this.#tableName,
+          Key: { pk: this.#pk, sk: WAKE_SK },
+          UpdateExpression: "SET wakeDueAt = :now",
+          ConditionExpression: "attribute_exists(wakeShard) AND wakeDueAt > :now",
+          ExpressionAttributeValues: { ":now": now },
+        }),
+      );
+    } catch (error) {
+      if (!isConditionalCheckFailed(error)) throw error;
+    }
   }
 
   async getWake(): Promise<WakeRecord> {
