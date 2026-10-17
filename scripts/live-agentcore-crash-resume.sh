@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Live AgentCore + DynamoDB crash→resume. Requires AWS CLI credentials that
+# can InvokeAgentRuntime and StopRuntimeSession (no static keys in-repo).
+set -euo pipefail
+
+: "${AWS_REGION:?Set AWS_REGION}"
+runtime_name="${AGENT_RUNTIME_NAME:-pi_durable_agentcore}"
+runtime_arn="${AGENT_RUNTIME_ARN:-}"
+runtime_id="${AGENT_RUNTIME_ID:-}"
+log_dir="${LIVE_LOG_DIR:-/tmp/agentcore-live}"
+mkdir -p "$log_dir"
+
+if [[ -z "$runtime_arn" ]]; then
+  if [[ -z "$runtime_id" ]]; then
+    runtime_id="$(aws bedrock-agentcore-control list-agent-runtimes \
+      --region "$AWS_REGION" \
+      --query "agentRuntimes[?agentRuntimeName=='${runtime_name}'].agentRuntimeId | [0]" \
+      --output text)"
+  fi
+  if [[ -z "$runtime_id" || "$runtime_id" == "None" ]]; then
+    echo "No AgentCore runtime named ${runtime_name}" >&2
+    exit 1
+  fi
+  runtime_arn="$(aws bedrock-agentcore-control get-agent-runtime \
+    --region "$AWS_REGION" \
+    --agent-runtime-id "$runtime_id" \
+    --query 'agentRuntimeArn' \
+    --output text)"
+fi
+
+# AgentCore session IDs must be 33–256 characters.
+session_id="${RUNTIME_SESSION_ID:-pi-durable-live-$(python3 -c 'import uuid; print(uuid.uuid4().hex + uuid.uuid4().hex[:8])')}"
+request_id="${REQUEST_ID:-live-crash-resume-1}"
+payload="$(python3 - <<PY
+import json
+print(json.dumps({
+    "prompt": "You MUST call the durable_wait tool with label crash-window as your first action. Do not skip the tool. After it returns, reply with one short sentence.",
+    "requestId": "${request_id}",
+}))
+PY
+)"
+
+echo "AGENT_RUNTIME_ID=${runtime_id}" | tee "$log_dir/runtime-ids.txt"
+echo "AGENT_RUNTIME_ARN=${runtime_arn}" | tee -a "$log_dir/runtime-ids.txt"
+echo "RUNTIME_SESSION_ID=${session_id}" | tee -a "$log_dir/runtime-ids.txt"
+echo "REQUEST_ID=${request_id}" | tee -a "$log_dir/runtime-ids.txt"
+printf '%s\n' "$payload" >"$log_dir/payload.json"
+
+invoke() {
+  local out="$1"
+  aws bedrock-agentcore invoke-agent-runtime \
+    --region "$AWS_REGION" \
+    --agent-runtime-arn "$runtime_arn" \
+    --runtime-session-id "$session_id" \
+    --qualifier DEFAULT \
+    --content-type application/json \
+    --accept application/json \
+    --payload "fileb://$log_dir/payload.json" \
+    "$out"
+}
+
+echo "=== invoke 1 (expect drop mid-run) ===" | tee "$log_dir/summary.log"
+set +e
+invoke "$log_dir/invoke-1-response.bin" >"$log_dir/invoke-1-cli.txt" 2>&1 &
+invoke_pid=$!
+set -e
+
+# Tool delay is 20s on the deployed runtime; stop while durable_wait is running.
+sleep 12
+echo "=== StopRuntimeSession (drop microVM) ===" | tee -a "$log_dir/summary.log"
+set +e
+aws bedrock-agentcore stop-runtime-session \
+  --region "$AWS_REGION" \
+  --agent-runtime-arn "$runtime_arn" \
+  --runtime-session-id "$session_id" \
+  --qualifier DEFAULT \
+  >"$log_dir/stop-session.txt" 2>&1
+stop_status=$?
+set -e
+echo "stop_status=${stop_status}" | tee -a "$log_dir/summary.log"
+cat "$log_dir/stop-session.txt" | tee -a "$log_dir/summary.log"
+
+wait "$invoke_pid" || true
+echo "invoke_1_done" | tee -a "$log_dir/summary.log"
+cat "$log_dir/invoke-1-cli.txt" >>"$log_dir/summary.log" || true
+python3 - <<PY
+from pathlib import Path
+p = Path("$log_dir/invoke-1-response.bin")
+if p.exists():
+    Path("$log_dir/invoke-1-response.txt").write_text(p.read_bytes().decode("utf-8", "replace"))
+PY
+
+# Lease TTL is 15s; wait for the dead owner so the replacement session can steal.
+sleep 18
+
+echo "=== invoke 2 (replacement session, same session id) ===" | tee -a "$log_dir/summary.log"
+set +e
+invoke "$log_dir/invoke-2-response.bin" >"$log_dir/invoke-2-cli.txt" 2>&1
+invoke2_status=$?
+set -e
+echo "invoke_2_status=${invoke2_status}" | tee -a "$log_dir/summary.log"
+cat "$log_dir/invoke-2-cli.txt" | tee -a "$log_dir/summary.log"
+python3 - <<PY
+from pathlib import Path
+p = Path("$log_dir/invoke-2-response.bin")
+if p.exists():
+    Path("$log_dir/invoke-2-response.txt").write_text(p.read_bytes().decode("utf-8", "replace"))
+print(p.read_bytes().decode("utf-8", "replace") if p.exists() else "")
+PY
+
+if [[ "$invoke2_status" -ne 0 ]]; then
+  echo "FAIL replacement invoke" | tee -a "$log_dir/summary.log"
+  exit 1
+fi
+
+echo "PASS live crash->resume session=${session_id}" | tee -a "$log_dir/summary.log"
+echo "Logs in ${log_dir}"

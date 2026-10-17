@@ -58,3 +58,18 @@ jobs:
           DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE }}
           IMAGE_TAG: ${{ github.sha }}
         run: bash scripts/deploy-agentcore.sh
+
+      - name: Live crash-resume against AgentCore
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AGENT_RUNTIME_NAME: ${{ vars.AGENT_RUNTIME_NAME }}
+          LIVE_LOG_DIR: ${{ runner.temp }}/agentcore-live
+        run: bash scripts/live-agentcore-crash-resume.sh
+
+      - name: Upload live test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentcore-live-logs
+          path: ${{ runner.temp }}/agentcore-live
+          if-no-files-found: warn

@@ -59,5 +59,34 @@ Required inputs: AWS CLI profile `fukuchi`, region `ap-northeast-1`, the
 updated `infra/github-oidc-bootstrap.yaml`, and `CAPABILITY_NAMED_IAM`.
 No AWS access keys. Do not run this from the agent environment.
 
-Existing deploy-role and execution-role ARNs stay as above. After this stack
-update, re-run GitHub Actions `agentcore-poc` (workflow_dispatch or push).
+Existing deploy-role and execution-role ARNs stay as above.
+
+Fukuchi applied this update: stack `pi-durable-agentcore-bootstrap` is
+**UPDATE_COMPLETE**. Trust now includes both immutable `sub` values. Re-run
+GitHub Actions `agentcore-poc` (workflow_dispatch or push). Do not run AWS
+from this agent environment.
+
+## Exact UPDATE command (invoke + StopRuntimeSession on GitHubDeployRole)
+
+Live crash-resume tests call `InvokeAgentRuntime` and `StopRuntimeSession`.
+Those actions were not on `GitHubDeployRole`. This is an in-place policy add:
+do **not** replace the OIDC provider, roles, ECR, or DynamoDB table. Every
+parameter keeps its previous value.
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
+```
