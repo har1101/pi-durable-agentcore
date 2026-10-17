@@ -32,9 +32,24 @@ Parameters:
     Type: String
     Default: repo:har1101@174846912/pi-durable-agentcore@1422425297
     Description: Immutable GitHub Actions OIDC sub prefix (repo:ownerId/repoId) when use_immutable_subject is true
+  AgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of the deployed AgentCore runtime (AGENT_RUNTIME_ARN printed by scripts/deploy-agentcore.sh).
+      Empty creates only the wake index; set it to also create the resume sweeper.
+  ResumeSweepSchedule:
+    Type: String
+    Default: rate(1 minute)
+    Description: EventBridge Scheduler expression for the resume sweeper (worst-case resume latency)
+  ResumeQualifier:
+    Type: String
+    Default: DEFAULT
+    Description: AgentCore runtime endpoint the sweeper invokes
 
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
+  CreateResumeSweeper: !Not [!Equals [!Ref AgentRuntimeArn, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -79,11 +94,27 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
+        - AttributeName: wakeShard
+          AttributeType: S
+        - AttributeName: wakeAt
+          AttributeType: N
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      # Sparse index of sessions that need an automatic resume (WAKE items in
+      # the w#<sha256(session)> partitions). Adding a GSI is an in-place
+      # UpdateTable: the table, its data, and its name are kept.
+      GlobalSecondaryIndexes:
+        - IndexName: wake-index
+          KeySchema:
+            - AttributeName: wakeShard
+              KeyType: HASH
+            - AttributeName: wakeAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   AgentRuntimeExecutionRole:
     Type: AWS::IAM::Role
@@ -308,6 +339,174 @@ Resources:
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:*
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*
 
+  ResumeSweeperRole:
+    Type: AWS::IAM::Role
+    Condition: CreateResumeSweeper
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClaimDueWakeItems
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: QueryDueSessions
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub ${SessionStore.Arn}/index/wake-index
+              - Sid: ClaimOnlyWakeItems
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt SessionStore.Arn
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys:
+                      - w#*
+        - PolicyName: ResumeThisAgentCoreRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref AgentRuntimeArn
+                  - !Sub ${AgentRuntimeArn}/runtime-endpoint/*
+
+  # Finds WAKE items with wakeAt <= now (crash with nobody retrying, approval
+  # deadline, timed wait), claims each one with a conditional write so
+  # concurrent sweeps invoke a session at most once per claim window, and
+  # sends {"type":"resume"} to the runtime with the session's own id. The
+  # runtime answers 202 at once and resumes from DynamoDB; it reschedules or
+  # clears the WAKE item itself. test/auto-resume.integration.test.ts runs
+  # this exact code (exports.sweep) against DynamoDB Local.
+  ResumeSweeperFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateResumeSweeper
+    Properties:
+      Description: Resume Pi Durable AgentCore sessions whose WAKE time is due
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt ResumeSweeperRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SessionStore
+          WAKE_INDEX_NAME: wake-index
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+          QUALIFIER: !Ref ResumeQualifier
+          CLAIM_MS: "120000"
+          MAX_CLAIMS: "20"
+      Code:
+        ZipFile: |
+          'use strict';
+          const SHARD = 'wake';
+          exports.sweep = async (o) => {
+            const { QueryCommand, UpdateItemCommand } = o.ddb;
+            const now = o.now ?? Date.now();
+            const n = { N: String(now) };
+            const r = { due: 0, claimed: 0, invoked: 0, failed: 0, skipped: 0 };
+            let start;
+            do {
+              const page = await o.client.send(new QueryCommand({
+                TableName: o.table, IndexName: o.index, Limit: 100, ExclusiveStartKey: start,
+                KeyConditionExpression: 'wakeShard = :s AND wakeAt <= :n',
+                ExpressionAttributeValues: { ':s': { S: SHARD }, ':n': n } }));
+              for (const it of page.Items || []) {
+                r.due++;
+                try {
+                  // Claim: only one sweep per window resumes a session; a runtime
+                  // write (new wakeAt) clears the claim and the counter.
+                  await o.client.send(new UpdateItemCommand({
+                    TableName: o.table, Key: { pk: it.pk, sk: it.sk },
+                    UpdateExpression: 'SET claimUntil = :c ADD claims :one',
+                    ConditionExpression: 'wakeShard = :s AND wakeAt <= :n AND ' +
+                      '(attribute_not_exists(claimUntil) OR claimUntil < :n) AND ' +
+                      '(attribute_not_exists(claims) OR claims < :max)',
+                    ExpressionAttributeValues: { ':s': { S: SHARD }, ':n': n, ':one': { N: '1' },
+                      ':c': { N: String(now + (o.claimMs || 120000)) },
+                      ':max': { N: String(o.maxClaims || 20) } } }));
+                } catch (e) {
+                  if (e.name === 'ConditionalCheckFailedException') { r.skipped++; continue; }
+                  throw e;
+                }
+                r.claimed++;
+                try {
+                  await o.invoke(it.sessionId.S, { type: 'resume', reason: it.reason ? it.reason.S : 'unknown' });
+                  r.invoked++;
+                } catch (e) {
+                  r.failed++;
+                  console.error('resume failed', it.pk.S, e.name, e.message);
+                }
+              }
+              start = page.LastEvaluatedKey;
+            } while (start);
+            console.log(JSON.stringify(r));
+            return r;
+          };
+          exports.handler = async () => {
+            const ddb = require('@aws-sdk/client-dynamodb');
+            const ac = require('@aws-sdk/client-bedrock-agentcore');
+            const agent = new ac.BedrockAgentCoreClient({});
+            const env = process.env;
+            return exports.sweep({
+              ddb, client: new ddb.DynamoDBClient({}), table: env.TABLE_NAME, index: env.WAKE_INDEX_NAME,
+              claimMs: Number(env.CLAIM_MS), maxClaims: Number(env.MAX_CLAIMS),
+              invoke: async (id, payload) => {
+                const out = await agent.send(new ac.InvokeAgentRuntimeCommand({
+                  agentRuntimeArn: env.AGENT_RUNTIME_ARN, qualifier: env.QUALIFIER, runtimeSessionId: id,
+                  contentType: 'application/json', accept: 'application/json',
+                  payload: new TextEncoder().encode(JSON.stringify(payload)) }));
+                if (out.response && out.response.transformToString) await out.response.transformToString();
+              } });
+          };
+
+  ResumeSweeperSchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: CreateResumeSweeper
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeResumeSweeper
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ResumeSweeperFunction.Arn
+
+  ResumeSweeperSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateResumeSweeper
+    Properties:
+      Description: Sweep due WAKE items and resume their AgentCore sessions
+      ScheduleExpression: !Ref ResumeSweepSchedule
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt ResumeSweeperFunction.Arn
+        RoleArn: !GetAtt ResumeSweeperSchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
 Outputs:
   GitHubDeployRoleArn:
     Value: !GetAtt GitHubDeployRole.Arn
@@ -321,3 +520,11 @@ Outputs:
     Value: !Ref SessionStore
   SessionTableArn:
     Value: !GetAtt SessionStore.Arn
+  WakeIndexName:
+    Value: wake-index
+  ResumeSweeperFunctionName:
+    Condition: CreateResumeSweeper
+    Value: !Ref ResumeSweeperFunction
+  ResumeSweeperScheduleName:
+    Condition: CreateResumeSweeper
+    Value: !Ref ResumeSweeperSchedule
