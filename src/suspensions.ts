@@ -137,6 +137,9 @@ export function wakePlan(input: {
   readonly now: number;
   readonly graceMs: number;
 }): WakePlan {
+  // A suspension outlives its tool only if the tool was aborted; without live
+  // work nothing waits on it, so it must not keep waking the session.
+  if (!input.activeWork) return { reason: "none" };
   const parked = activeSuspensions(input.suspensions)[0];
   if (parked !== undefined) {
     return {
@@ -144,6 +147,5 @@ export function wakePlan(input: {
       dueAt: dueAt(parked),
     };
   }
-  if (input.activeWork) return { reason: "in_flight", dueAt: input.now + input.graceMs };
-  return { reason: "none" };
+  return { reason: "in_flight", dueAt: input.now + input.graceMs };
 }

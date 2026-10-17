@@ -51,7 +51,7 @@ describe("approval decisions", () => {
 });
 
 describe("wake plan", () => {
-  it("prefers the earliest suspension, else in-flight grace, else nothing", () => {
+  it("follows live work: its earliest suspension, else in-flight grace; no work, no wake", () => {
     const parked = stateWithApproval(5_000);
     expect(wakePlan({ activeWork: true, suspensions: parked, now: 0, graceMs: 60_000 })).toEqual({
       reason: "approval_deadline",
@@ -62,6 +62,7 @@ describe("wake plan", () => {
       dueAt: 60_100,
     });
     expect(wakePlan({ activeWork: false, suspensions: undefined, now: 0, graceMs: 1 })).toEqual({ reason: "none" });
+    expect(wakePlan({ activeWork: false, suspensions: parked, now: 0, graceMs: 1 })).toEqual({ reason: "none" });
   });
 });
 
