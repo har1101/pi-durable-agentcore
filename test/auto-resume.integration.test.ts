@@ -1,5 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  createDynamoDbDocumentClient,
+  ensureSessionTable,
+  sessionPk,
+} from "../dist/storage/dynamodb.js";
+import { WAKE_SHARD } from "../dist/wake-sweeper.cjs";
 import {
   count,
   events,
@@ -40,6 +47,33 @@ async function startLongRun(server: ServerProcess, sessionId: string) {
     async () => count(await events(server, sessionId), "tool_call_started") > 0 || undefined,
     15_000,
     "tool_call_started",
+  );
+}
+
+/** A decided PARK whose tool task no longer exists, as an aborted gated call leaves it: still due for a wake. */
+async function plantOrphanedPark(table: string, sessionId: string): Promise<void> {
+  const options = { endpoint: process.env.DYNAMODB_ENDPOINT!, region: process.env.AWS_REGION! };
+  await ensureSessionTable(table, options);
+  const now = Date.now();
+  await createDynamoDbDocumentClient(options).send(
+    new PutCommand({
+      TableName: table,
+      Item: {
+        pk: sessionPk(sessionId),
+        sk: `PARK#${randomBytes(16).toString("hex")}`,
+        kind: "approval",
+        tool: "publish_report",
+        summary: 'publish_report {"title":"old"}',
+        requestedAt: now,
+        deadlineAt: now + 3_600_000,
+        decision: "approve",
+        decidedBy: "alice",
+        decidedAt: now,
+        wakeShard: WAKE_SHARD,
+        wakeAt: now,
+        runtimeSessionId: sessionId,
+      },
+    }),
   );
 }
 
@@ -150,6 +184,21 @@ describe("automatic resume through the wake sweeper", () => {
       requestId: "r-timer",
     });
     expect(fetched.body).toMatchObject({ status: "success", response: "Finished: waited 2s" });
+  });
+
+  it("consumes a decided PARK with no live task when a run parks, so the sweeper stops resuming the session", async () => {
+    const s = scenario();
+    const sessionId = `orphan-${randomUUID()}`;
+    const server = await s.server({ APPROVER_USER_IDS: "alice" });
+    const invoke = { prompt: "Publish the Q3 report [approval]", requestId: "r-orphan" };
+    const first = await post(server, sessionId, invoke);
+    expect(first.body.status).toBe("pending");
+    await plantOrphanedPark(s.table, sessionId);
+
+    const again = await post(server, sessionId, invoke);
+    expect(again.body).toMatchObject({ status: "pending", pending: first.body.pending });
+    expect((await s.sweep(server)).outcomes[sessionId]).toBeUndefined();
+    expect(count(await events(server, sessionId), "park_orphaned")).toBe(1);
   });
 
   it("lets exactly one of two racing resumers drive a crashed run", async () => {

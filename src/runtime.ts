@@ -277,6 +277,14 @@ function liveness(
     : "running";
 }
 
+function report(events: EventLog, error: unknown): void {
+  events
+    .record("harness_error", {
+      message: error instanceof Error ? error.message : String(error),
+    })
+    .catch(() => undefined);
+}
+
 function pendingItem(park: ParkRecord): PendingItem {
   return {
     kind: park.kind,
@@ -483,13 +491,7 @@ export class PiRuntime {
       {
         models,
         registry,
-        onReport: (error) => {
-          recorder
-            .record("harness_error", {
-              message: error instanceof Error ? error.message : String(error),
-            })
-            .catch(() => undefined);
-        },
+        onReport: (error) => report(recorder, error),
       },
       context,
     );
@@ -526,9 +528,15 @@ export class PiRuntime {
     });
 
     if (options.resume) {
+      // Armed before any work is scheduled, so a process that dies right after resuming still leaves a wake.
+      try {
+        await runtime.#ensureDriving();
+      } catch (error) {
+        await runtime.close().catch(() => undefined);
+        throw error;
+      }
       harness.resume();
       await recorder.record("resume_called", {});
-      void runtime.#ensureDriving().catch(() => undefined);
     }
     return runtime;
   }
@@ -632,12 +640,7 @@ export class PiRuntime {
         .then(() => this.#driveLoop(drive, armId))
         .catch((error: unknown) => {
           if (this.#drive === drive) this.#drive = undefined;
-          if (this.#closing) return;
-          this.events
-            .record("harness_error", {
-              message: error instanceof Error ? error.message : String(error),
-            })
-            .catch(() => undefined);
+          if (!this.#closing) report(this.events, error);
         });
     }
     return this.#drive.armed;
@@ -656,7 +659,7 @@ export class PiRuntime {
       if (state === "idle") {
         this.#drive = undefined;
         await this.#parks?.disarmRun(armId);
-        await this.#reapOrphanedParks();
+        await this.#reapOrphanedParks(() => this.harness.inspect(context));
         if (worked) await this.events.record("run_settled", {});
         return;
       }
@@ -664,11 +667,14 @@ export class PiRuntime {
         this.#drive = undefined;
         this.#closing = "parked";
         this.#onClosing?.();
-        await this.#parks?.disarmRun(armId);
         await this.events.record("runtime_parked", {
           gates: this.#parked.size,
         });
-        await this.#shutdown();
+        // RUN stays armed until the harness has closed: a crash in between costs one harmless resume, not a lost wake.
+        await this.#shutdown(async () => {
+          await this.#parks?.disarmRun(armId);
+          await this.#reapOrphanedParks(async () => inspection);
+        });
         return;
       }
       if (this.#drive !== drive) return;
@@ -681,24 +687,34 @@ export class PiRuntime {
   }
 
   /**
-   * With no live task, no gate can consume a PARK any more (its task was aborted), and its wake attributes would
-   * make the sweeper resume the session every minute. Pending ones are left: a new run may have just written them.
+   * A decided or due PARK whose tool task is not live has no gate left to consume it (the task was aborted), and its
+   * wake attributes would make the sweeper resume the session every minute. Pending ones are left, and so is any PARK
+   * of a live task: its gate applies it. PARKs are listed before `live` is read, so a PARK written meanwhile is either
+   * not listed or belongs to a live task.
    */
-  async #reapOrphanedParks(): Promise<void> {
+  async #reapOrphanedParks(
+    live: () => Promise<HarnessInspection>,
+  ): Promise<void> {
     if (this.#parks === undefined) return;
+    const parks = await this.#parks.open();
+    const gated = new Set(
+      (await live()).tasks.map((task) => parkIdOf(toolKey(this.sessionId, task.record.id))),
+    );
     const now = Date.now();
-    for (const park of await this.#parks.open()) {
-      if (verdictOf(park, now) === "pending") continue;
+    for (const park of parks) {
+      if (gated.has(park.id) || verdictOf(park, now) === "pending") continue;
       await this.#parks.consume(park.id, now);
       await this.events.record("park_orphaned", { tool: park.tool });
     }
   }
 
-  #shutdown(): Promise<void> {
+  /** `after` runs once the harness has closed; its failure is reported, not thrown, as the close itself succeeded. */
+  #shutdown(after?: () => Promise<void>): Promise<void> {
     this.#closed ??= (async () => {
       await this.#stream.stop();
       await this.harness.close(context);
       await this.events.record("runtime_closed", { reason: this.#closing });
+      await after?.().catch((error: unknown) => report(this.events, error));
     })();
     return this.#closed;
   }
