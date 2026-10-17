@@ -229,3 +229,80 @@ aws cloudformation update-stack \
     ParameterKey=EcrRepositoryName,UsePreviousValue=true \
     ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
 ```
+
+## Exact UPDATE command (wake index + resume sweeper)
+
+Adds automatic resume (crash with nobody retrying, approval deadlines, timed
+waits). In-place and additive only:
+
+- `SessionStore`: new GSI `wake-index` (`wakeShard` S, `wakeAt` N, projection
+  ALL) and the two attribute definitions it needs. Adding a GSI is an
+  `UpdateTable` with no interruption: the table, its name, its data, and its
+  `Retain` policies stay. CloudFormation waits for the index backfill (the
+  table only holds this PoC's sessions, so this is short).
+- When `AgentRuntimeArn` is not empty (condition `CreateResumeSweeper`):
+  `ResumeSweeperRole`, `ResumeSweeperFunction` (Lambda, nodejs22.x, arm64,
+  inline code), `ResumeSweeperSchedulerRole`, `ResumeSweeperSchedule`
+  (EventBridge Scheduler, `rate(1 minute)`). The roles are new and unnamed.
+- No change to `GitHubOidcProvider`, `GitHubDeployRole`,
+  `AgentRuntimeExecutionRole` (it already allows Query on `/index/*` and
+  UpdateItem/GetItem/PutItem on the table), or `ContainerRepository`.
+
+New parameters:
+
+| Parameter | Default | Value for this update |
+| --- | --- | --- |
+| `AgentRuntimeArn` | `""` (index only, no sweeper) | the runtime ARN (`AGENT_RUNTIME_ARN` in the deploy log, or the command below) |
+| `ResumeSweepSchedule` | `rate(1 minute)` | default |
+| `ResumeQualifier` | `DEFAULT` | default |
+
+New outputs: `WakeIndexName`, and with the sweeper `ResumeSweeperFunctionName`
+and `ResumeSweeperScheduleName`. Existing outputs are unchanged.
+
+Look up the runtime ARN (read-only):
+
+```bash
+aws bedrock-agentcore-control list-agent-runtimes \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --query "agentRuntimes[?agentRuntimeName=='pi_durable_agentcore'].agentRuntimeArn | [0]" \
+  --output text
+```
+
+Then, from the repository root, after this template is on `main`:
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true \
+    ParameterKey=AgentRuntimeArn,ParameterValue=arn:aws:bedrock-agentcore:ap-northeast-1:064212132988:runtime/REPLACE_WITH_RUNTIME_ID
+```
+
+`ResumeSweepSchedule` and `ResumeQualifier` take their defaults here; on later
+updates pass all three new parameters as `UsePreviousValue=true` too.
+Optionally run `aws cloudformation create-change-set` with the same arguments
+first: it must show `Modify` (no `Replacement`) for `SessionStore` and only
+`Add` for the four sweeper resources.
+
+If the runtime is ever recreated with a new ARN, rerun the update with the new
+`AgentRuntimeArn`. Setting it back to `""` deletes only the sweeper resources;
+the index stays.
+
+Also add the GitHub secret `APPROVAL_SIGNING_KEY` (at least 32 random
+characters, for example `openssl rand -hex 32`) to the `agentcore-poc`
+environment; the next deploy passes it to the runtime. Without it, pending
+approvals can only time out.
+
+Do not run this from the agent environment.
