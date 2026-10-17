@@ -14,7 +14,8 @@
     "demo:resume": "node dist/demo-worker.js resume",
     "pretest": "npm run build",
     "test": "bash scripts/with-dynamodb-local.sh npx vitest run",
-    "demo:crash-resume": "bash scripts/with-dynamodb-local.sh bash scripts/demo-crash-resume.sh"
+    "demo:crash-resume": "bash scripts/with-dynamodb-local.sh bash scripts/demo-crash-resume.sh",
+    "sync:infra": "npm run build && node scripts/sync-wake-sweeper.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "3.1152.0",

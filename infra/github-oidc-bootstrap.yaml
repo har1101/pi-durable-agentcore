@@ -382,7 +382,86 @@ Resources:
       Code:
         ZipFile: |
           // BEGIN GENERATED wake-sweeper (npm run sync:infra)
-          exports.handler = async () => { throw new Error("wake-sweeper not generated: run npm run sync:infra"); };
+          "use strict";
+          Object.defineProperty(exports, "__esModule", { value: true });
+          exports.WAKE_SHARD = exports.WAKE_INDEX = void 0;
+          exports.sweep = sweep;
+          exports.dynamoDeps = dynamoDeps;
+          exports.handler = handler;
+          // dist/wake-sweeper.cjs is also the Lambda's inline code (npm run sync:infra); keep it small and dependency-free.
+          exports.WAKE_INDEX = "WakeIndex";
+          exports.WAKE_SHARD = "w0";
+          /** Resumes each due session once; a session whose lease is live is skipped, its owner handles its own work. */
+          async function sweep(deps, now = Date.now()) {
+              const due = await deps.queryDue(now);
+              const queue = [...new Map(due.map((item) => [item.pk, item.runtimeSessionId]))];
+              const outcomes = {};
+              const worker = async () => {
+                  for (let next = queue.shift(); next; next = queue.shift()) {
+                      const [pk, id] = next;
+                      try {
+                          outcomes[id] = (await deps.leaseLive(pk)) ? "live" : await deps.resume(id);
+                      }
+                      catch (error) {
+                          outcomes[id] = "failed";
+                          console.error("resume failed", id, error);
+                      }
+                  }
+              };
+              await Promise.all(Array.from({ length: 8 }, worker));
+              return { due: due.length, outcomes };
+          }
+          function dynamoDeps(client, table) {
+              const { GetItemCommand, QueryCommand } = require("@aws-sdk/client-dynamodb");
+              return {
+                  async queryDue(now) {
+                      const due = [];
+                      let start;
+                      do {
+                          const page = await client.send(new QueryCommand({
+                              TableName: table,
+                              IndexName: exports.WAKE_INDEX,
+                              KeyConditionExpression: "wakeShard = :s AND wakeAt <= :n",
+                              ExpressionAttributeValues: { ":s": { S: exports.WAKE_SHARD }, ":n": { N: String(now) } },
+                              ExclusiveStartKey: start,
+                          }));
+                          for (const item of page.Items ?? []) {
+                              if (item.runtimeSessionId)
+                                  due.push({ pk: item.pk.S, runtimeSessionId: item.runtimeSessionId.S });
+                          }
+                          start = page.LastEvaluatedKey;
+                      } while (start);
+                      return due;
+                  },
+                  async leaseLive(pk) {
+                      const { Item } = await client.send(new GetItemCommand({ TableName: table, Key: { pk: { S: pk }, sk: { S: "LEASE" } }, ConsistentRead: true }));
+                      return Number(Item?.expiresAt?.N ?? 0) > Date.now();
+                  },
+              };
+          }
+          /** Lambda entry. Env: TABLE_NAME, AGENT_RUNTIME_ARN, AGENT_RUNTIME_QUALIFIER. */
+          async function handler() {
+              const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+              const agentcore = require("@aws-sdk/client-bedrock-agentcore");
+              const client = new agentcore.BedrockAgentCoreClient({});
+              const result = await sweep({
+                  ...dynamoDeps(new DynamoDBClient({}), process.env.TABLE_NAME),
+                  async resume(runtimeSessionId) {
+                      const reply = await client.send(new agentcore.InvokeAgentRuntimeCommand({
+                          agentRuntimeArn: process.env.AGENT_RUNTIME_ARN,
+                          qualifier: process.env.AGENT_RUNTIME_QUALIFIER || "DEFAULT",
+                          runtimeSessionId,
+                          contentType: "application/json",
+                          accept: "application/json",
+                          payload: Buffer.from('{"action":"resume"}'),
+                      }));
+                      const body = JSON.parse((await reply.response?.transformToString()) || "{}");
+                      return body.status ?? `http_${reply.statusCode}`;
+                  },
+              });
+              console.log(JSON.stringify(result));
+              return result;
+          }
           // END GENERATED wake-sweeper
 
   WakeSweeperSchedule:
