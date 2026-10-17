@@ -135,6 +135,45 @@ ECR, or DynamoDB. Every parameter keeps its previous value.
 
 Fukuchi applied **359c28f**: stack **UPDATE_COMPLETE**. Retrigger GHA deploy.
 
+## Exact UPDATE command (execution-role logs + GHA log read)
+
+Replacement invoke 500 left no `/aws/bedrock-agentcore/runtimes/pi_durable_agentcore-*`
+log group: `AgentRuntimeExecutionRole` could not `CreateLogGroup`/`PutLogEvents`.
+One in-place add:
+
+- execution role: logs CreateLogGroup/CreateLogStream/PutLogEvents/DescribeLogStreams
+  on `/aws/bedrock-agentcore/runtimes/*` (group + stream ARNs)
+- execution role: `xray:PutTraceSegments`, `PutTelemetryRecords`,
+  `cloudwatch:PutMetricData`
+- execution role: explicit
+  `inference-profile/global.anthropic.claude-*` (foundation-model + wildcard
+  inference-profile already present)
+- DynamoDB Get/Put/Update/Query/Transact*/ConditionCheck/Describe on the
+  session table ARN and `/index/*` (already present; unchanged)
+- GitHubDeployRole: DescribeLogGroups + DescribeLogStreams/GetLogEvents/
+  FilterLogEvents on the same log-group prefix so GHA can diagnose the 500
+
+Do **not** replace OIDC, roles, ECR, or DynamoDB. Every parameter keeps its
+previous value. Do not run AWS from this agent.
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
+```
+
 ```bash
 aws cloudformation update-stack \
   --profile fukuchi \
