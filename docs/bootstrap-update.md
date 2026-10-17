@@ -118,9 +118,36 @@ InvokeAgentRuntimeForUser. Existing List/Create/Get/Update/Invoke/Stop/PassRole
 stay. Do **not** replace OIDC, roles, ECR, or DynamoDB. Every parameter
 keeps its previous value.
 
-Fukuchi applied **0695991** (endpoint + TagResource + InvokeAgentRuntimeForUser):
-stack **UPDATE_COMPLETE**. Version APIs in 7d41dbc were not applied; do not
-wait for them unless logs deny a Version action. Retrigger GHA deploy.
+Fukuchi applied **0695991** and **7d41dbc**: stack **UPDATE_COMPLETE**.
+
+## Exact UPDATE command (workload-identity TagResource)
+
+GHA run 39001137344 pushed the image, then CreateAgentRuntime failed:
+
+`bedrock-agentcore:TagResource` on
+`arn:aws:bedrock-agentcore:ap-northeast-1:064212132988:workload-identity-directory/default/workload-identity/pi_durable_agentcore-UcUt2555jm`
+
+One in-place add: TagResource/ListTagsForResource on workload-identity ARNs,
+plus Create/Get/List/UpdateWorkloadIdentity. Do **not** replace OIDC, roles,
+ECR, or DynamoDB. Every parameter keeps its previous value.
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
+```
 
 ```bash
 aws cloudformation update-stack \
