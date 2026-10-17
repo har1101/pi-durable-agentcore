@@ -76,7 +76,7 @@ function asSeq(value: number): Seq {
   return value as Seq;
 }
 
-function sessionPk(sessionId: string): string {
+export function sessionPk(sessionId: string): string {
   const digest = createHash("sha256").update(sessionId).digest("hex");
   return `s#${digest}`;
 }

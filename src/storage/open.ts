@@ -7,6 +7,7 @@ import {
   type EffectLedger,
 } from "../effects.js";
 import { DynamoDbEventLog, FileEventLog, type EventLog } from "../event-log.js";
+import { DynamoDbWakeStore, NoWakeStore, type WakeStore } from "../wake.js";
 import {
   createDynamoDbDocumentClient,
   ensureSessionTable,
@@ -28,6 +29,7 @@ export interface SessionBackend {
   readonly storage: Storage;
   readonly events: EventLog;
   readonly effects: EffectLedger;
+  readonly wake: WakeStore;
 }
 
 export function configuredStorageBackend(): StorageBackend {
@@ -108,6 +110,12 @@ export async function openSessionBackend(
       storage,
       events,
       effects: new DynamoDbEffectLedger(await sessionTableClient(), tableName),
+      wake: new DynamoDbWakeStore(
+        await sessionTableClient(),
+        tableName,
+        options.sessionId,
+        storage.fencingToken,
+      ),
       location: `dynamodb:${tableName}#${options.sessionId}`,
     };
   }
@@ -120,6 +128,7 @@ export async function openSessionBackend(
     storage: await openNodeSqliteStorage(database),
     events,
     effects: new MemoryEffectLedger(),
+    wake: new NoWakeStore(),
     location: database,
   };
 }

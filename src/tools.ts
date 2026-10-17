@@ -13,8 +13,10 @@ import type { EventLog } from "./event-log.js";
 import {
   approvalIdFor,
   Suspensions,
+  timerIdFor,
   type Approval,
   type SuspensionsState,
+  type Timer,
 } from "./suspensions.js";
 
 declare const idempotencyKeyBrand: unique symbol;
@@ -239,6 +241,51 @@ export function approvedActionTool(scope: ToolScope, timeoutMs: number) {
       });
       return {
         output: [{ type: "text", text: `Action ${action} applied (${effect}).` }],
+      };
+    },
+  });
+}
+
+/**
+ * A timed wait that survives the process: the wake time is committed once
+ * (so a rerun keeps it), the session's wake plan points the resumer at it,
+ * and a rerun after the wake time finishes at once.
+ */
+export function waitUntilTool(scope: ToolScope) {
+  return defineKeyedTool(scope, {
+    name: "wait_until",
+    description: "Pause the run for a number of seconds, then continue.",
+    parameters: Type.Object({ seconds: Type.Number({ minimum: 0 }) }),
+    replay: "safe",
+    execute: async ({ seconds }, call, context) => {
+      const id = timerIdFor(call.key);
+      const { timer, created } = await call.api.commit(async (tx) => {
+        const state = await tx.doc(Suspensions);
+        const existing = state.items[id];
+        if (existing?.kind === "timer") return { timer: copy(existing), created: false };
+        const timer: Timer = {
+          kind: "timer",
+          id,
+          tool: "wait_until",
+          wakeAt: scope.now() + seconds * 1000,
+          status: "waiting",
+        };
+        state.items[id] = timer;
+        return { timer: copy(timer), created: true };
+      }, context);
+      if (created) await scope.events.record("timer_scheduled", timer);
+      if (timer.status === "waiting") {
+        await sleep(timer.wakeAt - scope.now(), context);
+        await call.api.commit(async (tx) => {
+          const item = (await tx.doc(Suspensions)).items[id];
+          if (item?.kind === "timer") item.status = "fired";
+        }, context);
+        await scope.events.record("timer_fired", { id, wakeAt: timer.wakeAt });
+      }
+      return {
+        output: [
+          { type: "text", text: `Waited until ${new Date(timer.wakeAt).toISOString()}.` },
+        ],
       };
     },
   });

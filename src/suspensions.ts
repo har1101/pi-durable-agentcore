@@ -109,6 +109,19 @@ export function activeSuspensions(state: SuspensionsState | undefined): Suspensi
     .sort((a, b) => dueAt(a) - dueAt(b));
 }
 
+/**
+ * What an invocation reports as pending: an undecided approval, or a timer
+ * whose wake time is still ahead. A due timer is about to fire, not parked.
+ */
+export function parkedOn(
+  state: SuspensionsState | undefined,
+  now: number,
+): Suspension | undefined {
+  return activeSuspensions(state).find(
+    (item) => item.kind === "approval" || item.wakeAt > now,
+  );
+}
+
 export function dueAt(item: Suspension): number {
   return item.kind === "approval" ? item.deadline : item.wakeAt;
 }

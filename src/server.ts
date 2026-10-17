@@ -11,6 +11,7 @@ import {
   parseCommand,
 } from "./commands.js";
 import { PiRuntime, sessionDirectory, type ModelMode } from "./runtime.js";
+import { LeaseContentionError } from "./storage/errors.js";
 import { openEventLog } from "./storage/open.js";
 
 const host = process.env.HOST ?? "0.0.0.0";
@@ -130,6 +131,11 @@ const server = createServer(async (request, response) => {
         );
         return;
       }
+      if (command.action === "resume") {
+        const runtime = await runtimeFor(sessionId(request));
+        json(response, 200, await runtime.resume());
+        return;
+      }
       const token = request.headers[APPROVER_TOKEN_HEADER];
       if (!approverAuthorized(Array.isArray(token) ? token[0] : token)) {
         response.setHeader("x-amzn-ErrorType", "AccessDeniedException");
@@ -182,6 +188,12 @@ const server = createServer(async (request, response) => {
     const stack = error instanceof Error ? error.stack : undefined;
     if (isFailedSessionError(error)) {
       forgetRuntime(sessionId(request, url));
+    }
+    if (error instanceof LeaseContentionError) {
+      process.stderr.write(`LeaseContention ${url.pathname}: ${message}\n`);
+      response.setHeader("x-amzn-ErrorType", "ConflictException");
+      json(response, 409, { message });
+      return;
     }
     process.stderr.write(
       `RuntimeClientError ${request.method} ${url.pathname}: ${message}\n${stack ?? ""}\n`,

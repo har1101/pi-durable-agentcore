@@ -30,16 +30,22 @@ import { scriptedResponse } from "./scripted-model.js";
 import {
   activeSuspensions,
   decide,
+  expireDue,
+  parkedOn,
   Suspensions,
+  wakePlan,
   type Approval,
   type DecisionOutcome,
   type Suspension,
+  type WakePlan,
 } from "./suspensions.js";
 import {
   approvedActionTool,
   durableWaitTool,
+  waitUntilTool,
   watchSuspensions,
 } from "./tools.js";
+import type { WakeStore } from "./wake.js";
 import { openSessionBackend } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -86,6 +92,7 @@ export type InvokeResult =
       reason: "timer";
       wakeAt: string;
     })
+  | (ResultBase & { status: "running"; requestId: string })
   | (ResultBase & { status: "idle" });
 
 export interface DecisionResult {
@@ -172,6 +179,14 @@ export class PiRuntime {
   readonly harness: Harness;
   #events: AgentEventStream;
   #busy = 0;
+  readonly #wake: WakeStore;
+  readonly #graceMs: number;
+  #plan: WakePlan = { reason: "none" };
+  #planWrittenAt = 0;
+  #wakeSync: Promise<void> | undefined;
+  #wakeDirty = false;
+  #closing = false;
+  #stopWakeTriggers: () => void = () => {};
 
   private constructor(
     sessionId: string,
@@ -180,6 +195,7 @@ export class PiRuntime {
     harness: Harness,
     root: Conversation,
     events: AgentEventStream,
+    wake: WakeStore,
   ) {
     this.sessionId = sessionId;
     this.sessionPath = sessionPath;
@@ -187,6 +203,8 @@ export class PiRuntime {
     this.harness = harness;
     this.root = root;
     this.#events = events;
+    this.#wake = wake;
+    this.#graceMs = Number(process.env.PI_WAKE_GRACE_MS ?? 60_000);
   }
 
   static async open(options: RuntimeOptions): Promise<PiRuntime> {
@@ -247,6 +265,7 @@ export class PiRuntime {
         tools: [
           durableWaitTool(scope, delayMs),
           approvedActionTool(scope, approvalTimeoutMs),
+          waitUntilTool(scope),
         ],
         hooks: [
           hook(GenerationTask, {
@@ -294,6 +313,7 @@ export class PiRuntime {
       harness,
       root,
       events,
+      opened.wake,
     );
 
     await recorder.record("runtime_opened", {
@@ -313,11 +333,146 @@ export class PiRuntime {
       harness.resume();
       await recorder.record("resume_called", {});
     }
+    runtime.#startWakeTriggers();
     return runtime;
   }
 
+  /** Working: an invocation is open, or a run is going that no suspension parks. */
   get busy(): boolean {
-    return this.#busy > 0;
+    return this.#busy > 0 || this.#plan.reason === "in_flight";
+  }
+
+  /**
+   * The internal invocation the resumer sends when a wake is due: reject
+   * approvals past their deadline, then report the active run's outcome.
+   * Opening the runtime already called `Harness.resume()`, so interrupted
+   * replay-safe tools and timers continue. Safe to repeat and to race.
+   */
+  async resume(): Promise<InvokeResult> {
+    this.#busy++;
+    try {
+      const now = Date.now();
+      const due = activeSuspensions(
+        await this.harness.snapshot(Suspensions, context),
+      ).some((item) => item.kind === "approval" && item.deadline <= now);
+      const expired = due
+        ? await this.harness.commit(
+            async (tx) =>
+              JSON.parse(
+                JSON.stringify(expireDue(await tx.doc(Suspensions), now)),
+              ) as Approval[],
+            context,
+          )
+        : [];
+      await this.recorder.record("resume_invoked", {
+        expiredApprovals: expired.map((approval) => approval.id),
+      });
+      const active = await this.#activeSubmission();
+      if (active === undefined) {
+        this.#requestWakeSync();
+        await this.#wakeSync;
+        return this.#idle();
+      }
+      const budgetMs = Number(process.env.PI_RESUME_WAIT_MS ?? 240_000);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const running = new Promise<InvokeResult>((resolve) => {
+        timer = setTimeout(
+          () =>
+            resolve({
+              status: "running",
+              requestId: active.requestId,
+              sessionId: this.sessionId,
+              response: "The run is still working.",
+            }),
+          budgetMs,
+        );
+      });
+      try {
+        return await Promise.race([
+          this.#outcome(active.submission, active.requestId),
+          running,
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    } finally {
+      this.#busy--;
+    }
+  }
+
+  #startWakeTriggers(): void {
+    const unsubscribe = this.harness.subscribeCommits(() =>
+      this.#requestWakeSync(),
+    );
+    const heartbeat = setInterval(
+      () => this.#requestWakeSync(),
+      Math.max(250, Math.floor(this.#graceMs / 3)),
+    );
+    heartbeat.unref();
+    this.#stopWakeTriggers = () => {
+      unsubscribe();
+      clearInterval(heartbeat);
+    };
+    this.#requestWakeSync();
+  }
+
+  /** Coalesces bursts of commits into at most one sync in flight plus one queued. */
+  #requestWakeSync(): void {
+    if (this.#closing) return;
+    if (this.#wakeSync !== undefined) {
+      this.#wakeDirty = true;
+      return;
+    }
+    this.#wakeSync = this.#syncWake()
+      .catch((error: unknown) => {
+        process.stderr.write(
+          `WakeSyncError: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      })
+      .finally(() => {
+        this.#wakeSync = undefined;
+        if (this.#wakeDirty) {
+          this.#wakeDirty = false;
+          this.#requestWakeSync();
+        }
+      });
+  }
+
+  /** Derive the wake plan from committed state and store it when it changed. */
+  async #syncWake(): Promise<void> {
+    const inspection = await this.harness.inspect(context);
+    const now = Date.now();
+    const plan = wakePlan({
+      activeWork:
+        inspection.tasks.length > 0 ||
+        inspection.submissions.some((item) => item.type === "input"),
+      suspensions: await this.harness.snapshot(Suspensions, context),
+      now,
+      graceMs: this.#graceMs,
+    });
+    const previous = this.#plan;
+    const changed =
+      plan.reason !== previous.reason ||
+      (plan.reason !== "in_flight" &&
+        plan.reason !== "none" &&
+        previous.reason !== "none" &&
+        plan.dueAt !== previous.dueAt);
+    const heartbeatDue =
+      plan.reason === "in_flight" &&
+      now - this.#planWrittenAt >= this.#graceMs / 3;
+    const firstSync = this.#planWrittenAt === 0;
+    if (!changed && !heartbeatDue && !firstSync) return;
+    await this.#wake.write(plan);
+    this.#plan = plan;
+    this.#planWrittenAt = now;
+    if (changed || firstSync) {
+      await this.recorder.record("wake_planned", {
+        reason: plan.reason,
+        ...(plan.reason !== "none"
+          ? { dueAt: new Date(plan.dueAt).toISOString() }
+          : {}),
+      });
+    }
   }
 
   async invoke(input: InvokeInput): Promise<InvokeResult> {
@@ -416,7 +571,7 @@ export class PiRuntime {
           .then((settled) => this.#settledResult(settled, requestId)),
         watchSuspensions(
           this.harness,
-          (state) => activeSuspensions(state)[0],
+          (state) => parkedOn(state, Date.now()),
           race.context,
         ).then((parked) =>
           pendingResult(parked, requestId, this.sessionId),
@@ -471,6 +626,9 @@ export class PiRuntime {
   }
 
   async close(): Promise<void> {
+    this.#closing = true;
+    this.#stopWakeTriggers();
+    await this.#wakeSync;
     await this.#events.stop();
     await this.harness.close(context);
     await this.recorder.record("runtime_closed", {});

@@ -45,8 +45,15 @@ function toolResult(
   };
 }
 
-/** Prompt directives pick the scripted tool: `[approval]`, else `durable_wait`. */
+/** Prompt directives pick the scripted tool: `[approval]`, `[timer]`, else `durable_wait`. */
 function scriptedToolCall(prompt: string) {
+  if (prompt.includes("[timer]")) {
+    return fauxToolCall(
+      "wait_until",
+      { seconds: Number(process.env.SCRIPTED_WAIT_SECONDS ?? 2) },
+      { id: SCRIPTED_TOOL_CALL_ID },
+    );
+  }
   if (prompt.includes("[approval]")) {
     return fauxToolCall("approved_action", { action: "deploy" }, { id: SCRIPTED_TOOL_CALL_ID });
   }

@@ -8,7 +8,9 @@ export type Command =
       readonly action: "decide";
       readonly approvalId: string;
       readonly decision: "approve" | "reject";
-    };
+    }
+  /** Sent by the resumer; it can only advance what durable state already allows. */
+  | { readonly action: "resume" };
 
 export type Parsed<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly message: string };
 
@@ -40,7 +42,8 @@ export function parseCommand(body: Record<string, unknown>): Parsed<Command> {
     }
     return { ok: true, value: { action, approvalId: body.approvalId, decision: body.decision } };
   }
-  return { ok: false, message: "action must be invoke or decide" };
+  if (action === "resume") return { ok: true, value: { action } };
+  return { ok: false, message: "action must be invoke, decide, or resume" };
 }
 
 /**
