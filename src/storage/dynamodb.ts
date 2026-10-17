@@ -8,6 +8,7 @@ import {
   ResourceInUseException,
   ResourceNotFoundException,
   TransactionCanceledException,
+  UpdateTableCommand,
   waitUntilTableExists,
   type DynamoDBClientConfig,
 } from "@aws-sdk/client-dynamodb";
@@ -76,10 +77,21 @@ function asSeq(value: number): Seq {
   return value as Seq;
 }
 
-function sessionPk(sessionId: string): string {
-  const digest = createHash("sha256").update(sessionId).digest("hex");
-  return `s#${digest}`;
+/** SHA-256 of the raw AgentCore session id; keys and logs use this, never the raw id. */
+export function sessionHash(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("hex");
 }
+
+function sessionPk(sessionId: string): string {
+  return `s#${sessionHash(sessionId)}`;
+}
+
+/**
+ * Sparse GSI over per-session WAKE items (`wakeShard` = "wake", `wakeAt` epoch
+ * ms). Only sessions that need an automatic resume carry `wakeShard`; the
+ * resume sweeper queries `wakeAt <= now` here.
+ */
+export const WAKE_INDEX_NAME = "wake-index";
 
 function commitSk(seq: number, chunk?: number): string {
   const base = `${COMMIT_PREFIX}${String(seq).padStart(16, "0")}`;
@@ -169,6 +181,14 @@ export async function ensureSessionTable(
   } = {},
 ): Promise<void> {
   const lowLevel = new DynamoDBClient(dynamoDbClientConfig(options));
+  const wakeIndex = {
+    IndexName: WAKE_INDEX_NAME,
+    KeySchema: [
+      { AttributeName: "wakeShard", KeyType: "HASH" as const },
+      { AttributeName: "wakeAt", KeyType: "RANGE" as const },
+    ],
+    Projection: { ProjectionType: "ALL" as const },
+  };
   try {
     await lowLevel.send(
       new CreateTableCommand({
@@ -177,11 +197,14 @@ export async function ensureSessionTable(
         AttributeDefinitions: [
           { AttributeName: "pk", AttributeType: "S" },
           { AttributeName: "sk", AttributeType: "S" },
+          { AttributeName: "wakeShard", AttributeType: "S" },
+          { AttributeName: "wakeAt", AttributeType: "N" },
         ],
         KeySchema: [
           { AttributeName: "pk", KeyType: "HASH" },
           { AttributeName: "sk", KeyType: "RANGE" },
         ],
+        GlobalSecondaryIndexes: [wakeIndex],
       }),
     );
   } catch (error) {
@@ -191,12 +214,47 @@ export async function ensureSessionTable(
     { client: lowLevel, maxWaitTime: 30 },
     { TableName: tableName },
   );
-  const described = await lowLevel.send(
+  let described = await lowLevel.send(
     new DescribeTableCommand({ TableName: tableName }),
   );
-  if (described.Table?.TableStatus !== "ACTIVE") {
-    throw new Error(`DynamoDB table ${tableName} is not ACTIVE`);
+  if (
+    !(described.Table?.GlobalSecondaryIndexes ?? []).some(
+      (index) => index.IndexName === WAKE_INDEX_NAME,
+    )
+  ) {
+    // A table created before the wake index existed (local only; the AWS
+    // table gets it from the CloudFormation update).
+    try {
+      await lowLevel.send(
+        new UpdateTableCommand({
+          TableName: tableName,
+          AttributeDefinitions: [
+            { AttributeName: "wakeShard", AttributeType: "S" },
+            { AttributeName: "wakeAt", AttributeType: "N" },
+          ],
+          GlobalSecondaryIndexUpdates: [{ Create: wakeIndex }],
+        }),
+      );
+    } catch (error) {
+      if (!(error instanceof ResourceInUseException)) throw error;
+    }
   }
+  for (let attempt = 0; attempt < 300; attempt++) {
+    described = await lowLevel.send(
+      new DescribeTableCommand({ TableName: tableName }),
+    );
+    const index = (described.Table?.GlobalSecondaryIndexes ?? []).find(
+      (candidate) => candidate.IndexName === WAKE_INDEX_NAME,
+    );
+    if (
+      described.Table?.TableStatus === "ACTIVE" &&
+      index?.IndexStatus === "ACTIVE"
+    ) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`DynamoDB table ${tableName} or ${WAKE_INDEX_NAME} is not ACTIVE`);
 }
 
 function maxIdFromWrites(writes: readonly StorageWrite[]): number {
