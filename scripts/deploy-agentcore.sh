@@ -13,7 +13,18 @@ image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITOR
 artifact="{\"containerConfiguration\":{\"containerUri\":\"${image_uri}\"}}"
 table_name="${DYNAMODB_TABLE:-pi-durable-agentcore-sessions}"
 delay_ms="${SCRIPTED_TOOL_DELAY_MS:-20000}"
-environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\",\"SCRIPTED_TOOL_DELAY_MS\":\"${delay_ms}\"}"
+approver_user_ids="${APPROVER_USER_IDS:-}"
+approval_timeout_ms="${PI_APPROVAL_TIMEOUT_MS:-86400000}"
+if [[ "$approver_user_ids" == *[\"\\]* ]]; then
+  echo "APPROVER_USER_IDS must not contain quotes or backslashes" >&2
+  exit 1
+fi
+if [[ ! "$approval_timeout_ms" =~ ^[0-9]+$ ]]; then
+  echo "PI_APPROVAL_TIMEOUT_MS must be a whole number of milliseconds" >&2
+  exit 1
+fi
+lifecycle='{"idleRuntimeSessionTimeout":28800,"maxLifetime":28800}'
+environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\",\"SCRIPTED_TOOL_DELAY_MS\":\"${delay_ms}\",\"APPROVER_USER_IDS\":\"${approver_user_ids}\",\"PI_APPROVAL_TIMEOUT_MS\":\"${approval_timeout_ms}\"}"
 
 runtime_id="${AGENT_RUNTIME_ID:-}"
 if [[ -z "$runtime_id" ]]; then
@@ -32,6 +43,7 @@ if [[ -z "$runtime_id" || "$runtime_id" == "None" ]]; then
     --network-configuration '{"networkMode":"PUBLIC"}' \
     --protocol-configuration '{"serverProtocol":"HTTP"}' \
     --environment-variables "$environment" \
+    --lifecycle-configuration "$lifecycle" \
     --platform-version V2 \
     --tags Project=pi-durable-agentcore \
     --output json | tee /tmp/agentcore-runtime.json
@@ -44,6 +56,7 @@ else
     --network-configuration '{"networkMode":"PUBLIC"}' \
     --protocol-configuration '{"serverProtocol":"HTTP"}' \
     --environment-variables "$environment" \
+    --lifecycle-configuration "$lifecycle" \
     --metadata-configuration '{"requireMMDSV2":true}' \
     --platform-version V2 \
     --output json | tee /tmp/agentcore-runtime.json
@@ -57,6 +70,7 @@ runtime = data.get("agentRuntime") or data
 rid = runtime.get("agentRuntimeId") or data.get("agentRuntimeId") or ""
 arn = runtime.get("agentRuntimeArn") or data.get("agentRuntimeArn") or ""
 Path("/tmp/agentcore-runtime-id").write_text(rid)
+Path("/tmp/agentcore-runtime-arn").write_text(arn)
 print(f"AGENT_RUNTIME_ID={rid}")
 print(f"AGENT_RUNTIME_ARN={arn}")
 PY
@@ -93,4 +107,15 @@ status="${status:-}"
 if [[ "$status" != "READY" ]]; then
   echo "DEFAULT endpoint did not become READY" >&2
   exit 1
+fi
+
+runtime_arn="$(cat /tmp/agentcore-runtime-arn)"
+echo
+echo "============================================================"
+echo "Bootstrap stack parameter for the wake sweeper:"
+echo "  AgentRuntimeArn=${runtime_arn}"
+echo "See docs/bootstrap-update.md, \"Exact UPDATE command (wake sweeper + WakeIndex)\"."
+echo "============================================================"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  printf '### Bootstrap parameter\n\n`AgentRuntimeArn=%s`\n' "$runtime_arn" >>"$GITHUB_STEP_SUMMARY"
 fi

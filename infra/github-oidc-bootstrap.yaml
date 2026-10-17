@@ -32,9 +32,14 @@ Parameters:
     Type: String
     Default: repo:har1101@174846912/pi-durable-agentcore@1422425297
     Description: Immutable GitHub Actions OIDC sub prefix (repo:ownerId/repoId) when use_immutable_subject is true
+  AgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: AgentCore runtime ARN printed by scripts/deploy-agentcore.sh (AgentRuntimeArn=...). Empty keeps the wake sweeper schedule disabled.
 
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
+  HasAgentRuntime: !Not [!Equals [!Ref AgentRuntimeArn, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -79,11 +84,26 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
+        - AttributeName: wakeShard
+          AttributeType: S
+        - AttributeName: wakeAt
+          AttributeType: N
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: WakeIndex
+          KeySchema:
+            - AttributeName: wakeShard
+              KeyType: HASH
+            - AttributeName: wakeAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - runtimeSessionId
 
   AgentRuntimeExecutionRole:
     Type: AWS::IAM::Role
@@ -308,6 +328,81 @@ Resources:
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:*
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*
 
+  WakeSweeperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadWakeIndexAndLease
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub ${SessionStore.Arn}/index/WakeIndex
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt SessionStore.Arn
+        - PolicyName: ResumeAgentCoreSessions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !If
+                  - HasAgentRuntime
+                  - - !Ref AgentRuntimeArn
+                    - !Sub ${AgentRuntimeArn}/runtime-endpoint/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/none
+
+  WakeSweeperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Sends {"action":"resume"} to every AgentCore session that is due in WakeIndex
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt WakeSweeperRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SessionStore
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+          AGENT_RUNTIME_QUALIFIER: DEFAULT
+      Code:
+        ZipFile: |
+          // BEGIN GENERATED wake-sweeper (npm run sync:infra)
+          exports.handler = async () => { throw new Error("wake-sweeper not generated: run npm run sync:infra"); };
+          // END GENERATED wake-sweeper
+
+  WakeSweeperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Runs the wake sweeper every minute while AgentRuntimeArn is set
+      ScheduleExpression: rate(1 minute)
+      State: !If [HasAgentRuntime, ENABLED, DISABLED]
+      Targets:
+        - Id: WakeSweeperFunction
+          Arn: !GetAtt WakeSweeperFunction.Arn
+
+  WakeSweeperInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WakeSweeperFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WakeSweeperSchedule.Arn
+
 Outputs:
   GitHubDeployRoleArn:
     Value: !GetAtt GitHubDeployRole.Arn
@@ -321,3 +416,7 @@ Outputs:
     Value: !Ref SessionStore
   SessionTableArn:
     Value: !GetAtt SessionStore.Arn
+  WakeSweeperFunctionArn:
+    Value: !GetAtt WakeSweeperFunction.Arn
+  WakeIndexName:
+    Value: WakeIndex
