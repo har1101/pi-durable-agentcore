@@ -118,6 +118,10 @@ InvokeAgentRuntimeForUser. Existing List/Create/Get/Update/Invoke/Stop/PassRole
 stay. Do **not** replace OIDC, roles, ECR, or DynamoDB. Every parameter
 keeps its previous value.
 
+Fukuchi applied **0695991** (endpoint + TagResource + InvokeAgentRuntimeForUser):
+stack **UPDATE_COMPLETE**. Version APIs in 7d41dbc were not applied; do not
+wait for them unless logs deny a Version action. Retrigger GHA deploy.
+
 ```bash
 aws cloudformation update-stack \
   --profile fukuchi \
