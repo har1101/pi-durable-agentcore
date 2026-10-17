@@ -608,6 +608,7 @@ export class PiRuntime {
     // Once parked nobody awaits it; the Harness closing rejects it.
     settled.catch(() => undefined);
     const tagged = settled.then((record) => ({ record }));
+    tagged.catch(() => undefined);
     for (;;) {
       const next = await Promise.race([
         tagged,
