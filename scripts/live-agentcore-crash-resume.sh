@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Live AgentCore + DynamoDB crash→resume. Requires AWS CLI credentials that
 # can InvokeAgentRuntime and StopRuntimeSession (no static keys in-repo).
+#
+# Invoke 1 is stopped mid-durable_wait with StopRuntimeSession. AgentCore then
+# returns RuntimeClientError 500 on that in-flight invoke. That 500 is
+# expected and is not a test failure. Invoke 2 on the same runtimeSessionId
+# must return 200 success, and CloudWatch TOOL_ATTEMPT lines for that
+# session (not the whole log group) must be exactly 2.
 set -euo pipefail
 
 : "${AWS_REGION:?Set AWS_REGION}"
@@ -124,11 +130,12 @@ dump_cloudwatch() {
     --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/${runtime_id}" \
     --output json >"$log_dir/cw-log-groups.json" 2>"$log_dir/cw-describe.err"
   python3 - <<PY
-import json, subprocess, os, sys
+import json, subprocess, os
 from pathlib import Path
 region = os.environ["AWS_REGION"]
 log_dir = Path("$log_dir")
 rid = "$runtime_id"
+session_id = "$session_id"
 
 def dump_err(name):
     path = log_dir / name
@@ -154,12 +161,13 @@ interesting = (
     "Provider is not configured", "idempotent", "Session failed",
     "runtime_opened", "resume_called",
 )
+session_events = []
 for i, name in enumerate(matched[:3]):
     streams_out = log_dir / f"cw-streams-{i}.json"
     subprocess.run(
         ["aws", "logs", "describe-log-streams", "--region", region,
          "--log-group-name", name, "--order-by", "LastEventTime",
-         "--descending", "--limit", "10", "--output", "json"],
+         "--descending", "--limit", "20", "--output", "json"],
         stdout=streams_out.open("w"), stderr=(log_dir / "cw-streams.err").open("a"),
         check=False,
     )
@@ -172,46 +180,59 @@ for i, name in enumerate(matched[:3]):
     names = [s.get("logStreamName","") for s in streams]
     (log_dir / f"cw-stream-names-{i}.txt").write_text("\n".join(names) + "\n")
     print(f"cw_streams_{i}=" + ",".join(names) if names else f"cw_streams_{i}=(none)")
+    session_streams = [s for s in streams if session_id in (s.get("logStreamName") or "")]
+    if not session_streams:
+        session_streams = [{"logStreamName": f"runtime-logs-{session_id}"}]
+    print("cw_session_streams=" + ",".join(s.get("logStreamName","") for s in session_streams))
     subprocess.run(
         ["aws", "logs", "filter-log-events", "--region", region,
-         "--log-group-name", name, "--limit", "200", "--output", "json"],
+         "--log-group-name", name, "--filter-pattern", session_id,
+         "--limit", "200", "--output", "json"],
         stdout=(log_dir / f"cw-events-{i}.json").open("w"),
         stderr=(log_dir / "cw-filter.err").open("a"),
         check=False,
     )
     dump_err("cw-filter.err")
-    for j, stream in enumerate(streams[:5]):
+    for j, stream in enumerate(session_streams[:5]):
         sn = stream.get("logStreamName")
         if not sn:
             continue
+        out = log_dir / f"cw-session-{i}-{j}.json"
         subprocess.run(
             ["aws", "logs", "get-log-events", "--region", region,
              "--log-group-name", name, "--log-stream-name", sn,
-             "--limit", "100", "--start-from-head", "--output", "json"],
-            stdout=(log_dir / f"cw-get-{i}-{j}.json").open("w"),
+             "--limit", "200", "--start-from-head", "--output", "json"],
+            stdout=out.open("w"),
             stderr=(log_dir / "cw-get.err").open("a"),
             check=False,
         )
+        try:
+            for event in json.loads(out.read_text() or "{}").get("events") or []:
+                session_events.append({
+                    **event,
+                    "logStreamName": sn,
+                    "logGroupName": name,
+                })
+        except Exception:
+            pass
     dump_err("cw-get.err")
     printed = 0
-    for path in sorted(log_dir.glob("cw-*.json")):
-        try:
-            events = json.loads(path.read_text() or "{}").get("events") or []
-        except Exception:
-            continue
-        for event in events:
-            msg = (event.get("message") or "").replace("\n", " | ")
-            if any(key in msg for key in interesting):
-                print(f"cw_event {path.name}: {msg[:500]}")
-                printed += 1
+    for event in session_events:
+        msg = (event.get("message") or "").replace("\n", " | ")
+        if any(key in msg for key in interesting):
+            print(f"cw_event session: {msg[:500]}")
+            printed += 1
     print(f"cw_interesting_events={printed}")
     if printed == 0:
-        print("cw_events=(none visible in dumped files)")
+        print("cw_events=(none visible for this runtimeSessionId)")
+(log_dir / "cw-session-events.json").write_text(json.dumps({"events": session_events}, indent=2))
 PY
   set -e
 }
 
-echo "=== invoke 1 (expect drop mid-run) ===" | tee -a "$log_dir/summary.log"
+# Invoke-1 500 after StopRuntimeSession is expected: the in-flight HTTP
+# invoke is torn down with the microVM. Do not treat that as a test failure.
+echo "=== invoke 1 (expect drop mid-run; 500 after StopRuntimeSession is expected) ===" | tee -a "$log_dir/summary.log"
 set +e
 invoke "$log_dir/invoke-1-response.bin" >"$log_dir/invoke-1-cli.txt" 2>&1 &
 invoke_pid=$!
@@ -234,6 +255,7 @@ cat "$log_dir/stop-session.txt" | tee -a "$log_dir/summary.log"
 
 wait "$invoke_pid" || true
 echo "invoke_1_done" | tee -a "$log_dir/summary.log"
+echo "invoke_1_500_expected=StopRuntimeSession dropped the in-flight invoke" | tee -a "$log_dir/summary.log"
 cat "$log_dir/invoke-1-cli.txt" >>"$log_dir/summary.log" || true
 python3 - <<PY
 from pathlib import Path
@@ -299,24 +321,39 @@ if status != "success":
 if "Provider is not configured" in response or "unanswered" in response:
     print(f"FAIL replacement invoke still shows model/config error: {response[:500]}")
     sys.exit(1)
+session_id = "$session_id"
 seen = set()
-for path in sorted(log_dir.glob("cw-*.json")):
+paths = [log_dir / "cw-session-events.json", *sorted(log_dir.glob("cw-session-*.json"))]
+for path in paths:
+    if not path.exists():
+        continue
     try:
         data = json.loads(path.read_text() or "{}")
     except Exception:
         continue
     events = data.get("events") or []
     for event in events:
+        stream = event.get("logStreamName") or ""
         msg = event.get("message") or ""
+        if session_id not in stream and session_id not in msg:
+            continue
         for match in re.finditer(r"TOOL_ATTEMPT (\{.*\})", msg):
-            seen.add(match.group(1))
+            payload = match.group(1)
+            try:
+                parsed = json.loads(payload)
+            except Exception:
+                parsed = {}
+            if parsed.get("sessionId") not in (None, session_id) and session_id not in payload:
+                continue
+            seen.add(payload)
 attempts = len(seen)
 print(f"tool_attempts_in_cloudwatch={attempts}")
+print(f"tool_attempts_session={session_id}")
 (log_dir / "tool-attempts-count.txt").write_text("\n".join(sorted(seen)) + ("\n" if seen else ""))
-if attempts < 2:
-    print(f"FAIL expected >=2 unique TOOL_ATTEMPT log lines, got {attempts}")
+if attempts != 2:
+    print(f"FAIL expected exactly 2 TOOL_ATTEMPT lines for runtimeSessionId={session_id}, got {attempts}")
     sys.exit(1)
-print("PASS invoke-2 success with tool attempts")
+print("PASS invoke-2 success with session-scoped tool attempts=2")
 PY
 
 echo "PASS live crash->resume session=${session_id}" | tee -a "$log_dir/summary.log"

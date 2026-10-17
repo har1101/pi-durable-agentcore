@@ -220,6 +220,7 @@ export class PiRuntime {
           timestamp: new Date().toISOString(),
           pid: process.pid,
           label,
+          sessionId: options.sessionId,
         };
         process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
         await appendFile(attemptsPath, `${JSON.stringify(attempt)}\n`, "utf8");

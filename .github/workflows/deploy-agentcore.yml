@@ -61,6 +61,10 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: bash scripts/deploy-agentcore.sh
 
+      # Invoke 1 is dropped mid-tool with StopRuntimeSession. AgentCore reports
+      # RuntimeClientError 500 on that in-flight call; that 500 is expected and
+      # is not a failure. Invoke 2 on the same runtimeSessionId must succeed,
+      # and CloudWatch TOOL_ATTEMPT for that session must be exactly 2.
       - name: Live crash-resume against AgentCore
         env:
           AWS_REGION: ${{ vars.AWS_REGION }}
