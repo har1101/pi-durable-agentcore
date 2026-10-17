@@ -13,7 +13,33 @@ image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITOR
 artifact="{\"containerConfiguration\":{\"containerUri\":\"${image_uri}\"}}"
 table_name="${DYNAMODB_TABLE:-pi-durable-agentcore-sessions}"
 delay_ms="${SCRIPTED_TOOL_DELAY_MS:-20000}"
-environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\",\"SCRIPTED_TOOL_DELAY_MS\":\"${delay_ms}\"}"
+# Built with json.dumps so secrets and ARNs are escaped correctly.
+# APPROVAL_SIGNING_KEY is optional: without it pending approvals can only time
+# out (auto-reject). It is visible to principals that can GetAgentRuntime;
+# move it to Secrets Manager before production use.
+environment="$(AWS_REGION="$AWS_REGION" MODEL_ID="$model_id" TABLE_NAME="$table_name" DELAY_MS="$delay_ms" python3 - <<'PY'
+import json, os
+env = {
+    "MODEL_PROVIDER": "bedrock",
+    "BEDROCK_MODEL_ID": os.environ["MODEL_ID"],
+    "STATE_DIRECTORY": "/tmp/pi-durable-agentcore",
+    "STORAGE_BACKEND": "dynamodb",
+    "DYNAMODB_TABLE": os.environ["TABLE_NAME"],
+    "AWS_REGION": os.environ["AWS_REGION"],
+    "PI_SESSION_LEASE_TTL_MS": os.environ.get("PI_SESSION_LEASE_TTL_MS") or "15000",
+    "SCRIPTED_TOOL_DELAY_MS": os.environ["DELAY_MS"],
+    # Approvals outlive one 8 h AgentCore lifetime; timeouts auto-reject.
+    "APPROVAL_TIMEOUT_MS": os.environ.get("APPROVAL_TIMEOUT_MS") or "86400000",
+    # Crash with nobody retrying: the resume sweeper continues after this.
+    "INFLIGHT_GRACE_MS": os.environ.get("INFLIGHT_GRACE_MS") or "60000",
+    "INLINE_WAIT_MAX_MS": os.environ.get("INLINE_WAIT_MAX_MS") or "30000",
+}
+key = os.environ.get("APPROVAL_SIGNING_KEY") or ""
+if key:
+    env["APPROVAL_SIGNING_KEY"] = key
+print(json.dumps(env, separators=(",", ":")))
+PY
+)"
 
 runtime_id="${AGENT_RUNTIME_ID:-}"
 if [[ -z "$runtime_id" ]]; then
