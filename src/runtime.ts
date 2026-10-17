@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
@@ -30,7 +30,7 @@ import {
   applyBedrockRuntimeEnv,
   createConfiguredAmazonBedrockProvider,
 } from "./bedrock-provider.js";
-import { EventRecorder } from "./event-recorder.js";
+import { openEventLog, type EventLog } from "./event-recorder.js";
 import { openSessionStorage } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -59,7 +59,10 @@ export interface InvokeResult {
   detail?: unknown;
 }
 
-function sessionDirectory(stateDirectory: string, sessionId: string): string {
+export function sessionDirectory(
+  stateDirectory: string,
+  sessionId: string,
+): string {
   const digest = createHash("sha256").update(sessionId).digest("hex");
   return join(stateDirectory, "sessions", digest);
 }
@@ -146,36 +149,41 @@ function assistantText(message: AssistantMessage | undefined): string {
 export class PiRuntime {
   readonly sessionId: string;
   readonly sessionPath: string;
-  readonly recorder: EventRecorder;
+  readonly events: EventLog;
   readonly root: Conversation;
   readonly harness: Harness;
-  #events: AgentEventStream;
+  #stream: AgentEventStream;
   #busy = 0;
 
   private constructor(
     sessionId: string,
     sessionPath: string,
-    recorder: EventRecorder,
+    events: EventLog,
     harness: Harness,
     root: Conversation,
-    events: AgentEventStream,
+    stream: AgentEventStream,
   ) {
     this.sessionId = sessionId;
     this.sessionPath = sessionPath;
-    this.recorder = recorder;
+    this.events = events;
     this.harness = harness;
     this.root = root;
-    this.#events = events;
+    this.#stream = stream;
   }
 
   static async open(options: RuntimeOptions): Promise<PiRuntime> {
     const modelMode = options.modelMode ?? "scripted";
     const path = sessionDirectory(options.stateDirectory, options.sessionId);
     await mkdir(path, { recursive: true });
-    const recorder = await EventRecorder.open(
-      join(path, "events.jsonl"),
-      options.sessionId,
-    );
+    const opened = await openSessionStorage({
+      sessionId: options.sessionId,
+      sessionPath: path,
+    });
+    const recorder = openEventLog({
+      sessionId: options.sessionId,
+      sessionPath: path,
+      backend: opened.backend,
+    });
     const models = createModels();
     let bedrockAuthSource: string | undefined;
 
@@ -208,14 +216,13 @@ export class PiRuntime {
     const delayMs =
       options.scriptedDelayMs ??
       Number(process.env.SCRIPTED_TOOL_DELAY_MS ?? 5_000);
-    const attemptsPath = join(path, "tool-attempts.jsonl");
     const waitTool = defineTool({
       name: "durable_wait",
       description:
         "Wait briefly so process-crash recovery can be demonstrated.",
       parameters: Type.Object({ label: Type.String() }),
       replay: "safe",
-      execute: async ({ label }) => {
+      execute: async ({ label }, api) => {
         const attempt = {
           timestamp: new Date().toISOString(),
           pid: process.pid,
@@ -223,7 +230,10 @@ export class PiRuntime {
           sessionId: options.sessionId,
         };
         process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
-        await appendFile(attemptsPath, `${JSON.stringify(attempt)}\n`, "utf8");
+        await recorder.record("tool_attempt", {
+          tool: "durable_wait",
+          callId: api.callId,
+        });
         await recorder.record("tool_call_started", {
           name: "durable_wait",
           label,
@@ -250,19 +260,17 @@ export class PiRuntime {
       }),
     );
 
-    const opened = await openSessionStorage({
-      sessionId: options.sessionId,
-      sessionPath: path,
-    });
     const harness = await Harness.open(
       opened.storage,
       {
         models,
         registry,
         onReport: (error) => {
-          void recorder.record("harness_error", {
-            message: error instanceof Error ? error.message : String(error),
-          });
+          recorder
+            .record("harness_error", {
+              message: error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
         },
       },
       context,
@@ -312,7 +320,7 @@ export class PiRuntime {
   async invoke(input: InvokeInput): Promise<InvokeResult> {
     const requestId = input.requestId ?? randomUUID();
     this.#busy++;
-    await this.recorder.record("invocation_started", {
+    await this.events.record("invocation_started", {
       requestId,
       prompt: input.prompt,
     });
@@ -328,7 +336,7 @@ export class PiRuntime {
       const settled = await submission.wait(context);
       if (settled.status === "unanswered" || settled.type !== "input") {
         const payload = unansweredPayload(settled);
-        await this.recorder.record("invocation_failed", {
+        await this.events.record("invocation_failed", {
           requestId,
           reason: payload.reason,
           detail: payload.detail ?? null,
@@ -349,7 +357,7 @@ export class PiRuntime {
       const response = assistantText(
         answer?.model?.[0] as AssistantMessage | undefined,
       );
-      await this.recorder.record("invocation_completed", {
+      await this.events.record("invocation_completed", {
         requestId,
         response,
       });
@@ -364,19 +372,9 @@ export class PiRuntime {
     }
   }
 
-  async readEvents(): Promise<string> {
-    try {
-      return await readFile(this.recorder.path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
-      throw error;
-    }
-  }
-
   async close(): Promise<void> {
-    await this.#events.stop();
+    await this.#stream.stop();
     await this.harness.close(context);
-    await this.recorder.record("runtime_closed", {});
-    await this.recorder.flush();
+    await this.events.record("runtime_closed", {});
   }
 }

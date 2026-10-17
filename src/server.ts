@@ -5,7 +5,8 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import { SessionFailed } from "@earendil-works/pi-durable";
-import { PiRuntime, type ModelMode } from "./runtime.js";
+import { openEventLog } from "./event-recorder.js";
+import { PiRuntime, sessionDirectory, type ModelMode } from "./runtime.js";
 
 const host = process.env.HOST ?? "0.0.0.0";
 const port = Number(process.env.PORT ?? 8080);
@@ -129,12 +130,11 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && url.pathname === "/events") {
-      const runtime = await runtimeFor(sessionId(request, url));
-      const events = (await runtime.readEvents())
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as unknown);
+      const id = sessionId(request, url);
+      const events = await openEventLog({
+        sessionId: id,
+        sessionPath: sessionDirectory(stateDirectory, id),
+      }).list();
       if (request.headers.accept?.includes("text/html")) {
         const escaped = JSON.stringify(events, null, 2)
           .replaceAll("&", "&amp;")
@@ -145,7 +145,7 @@ const server = createServer(async (request, response) => {
           `<!doctype html><title>Pi Durable checkpoints</title><h1>Committed steps</h1><pre>${escaped}</pre>`,
         );
       } else {
-        json(response, 200, { sessionId: runtime.sessionId, events });
+        json(response, 200, { sessionId: id, events });
       }
       return;
     }

@@ -76,9 +76,18 @@ function asSeq(value: number): Seq {
   return value as Seq;
 }
 
-function sessionPk(sessionId: string): string {
-  const digest = createHash("sha256").update(sessionId).digest("hex");
-  return `s#${digest}`;
+function sessionDigest(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("hex");
+}
+
+/** Checkpoint partition: LEASE, META, COMMIT#…, and the PARK#…/RUN items recover() skips. */
+export function sessionPk(sessionId: string): string {
+  return `s#${sessionDigest(sessionId)}`;
+}
+
+/** Event log partition, a sibling recover() never reads, so the log can grow without slowing opens. */
+export function eventPk(sessionId: string): string {
+  return `e#${sessionDigest(sessionId)}`;
 }
 
 function commitSk(seq: number, chunk?: number): string {

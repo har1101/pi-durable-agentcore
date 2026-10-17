@@ -43,7 +43,10 @@ node "$repo_root/dist/demo-worker.js" resume \
   --session-id "$session_id" \
   --delay-ms 50 >"$resume_log" 2>&1
 
-attempts="$(find "$state_dir/sessions" -name tool-attempts.jsonl -exec wc -l {} \; | awk '{sum += $1} END {print sum + 0}')"
+events="$(node "$repo_root/dist/demo-worker.js" events \
+  --state-dir "$state_dir" \
+  --session-id "$session_id")"
+attempts="$(grep -c '"kind":"tool_attempt"' <<<"$events" || true)"
 grep -q "resume_called" "$resume_log"
 grep -q "DEMO_RESULT" "$resume_log"
 grep -q '"storage":"dynamodb"' "$resume_log"
