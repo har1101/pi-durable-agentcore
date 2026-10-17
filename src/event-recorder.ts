@@ -20,7 +20,8 @@ export interface RecordedEvent {
 
 /** Append-only session event log. Each record resolves once it and every earlier record of this writer is stored. */
 export interface EventLog {
-  record(kind: string, detail: unknown): Promise<void>;
+  /** With `signal`, a failed write is retried until it is stored or the signal aborts; it never fails otherwise. */
+  record(kind: string, detail: unknown, signal?: AbortSignal): Promise<void>;
   list(): Promise<RecordedEvent[]>;
 }
 
@@ -57,7 +58,7 @@ class DynamoDbEventLog implements EventLog {
     this.#pk = eventPk(sessionId);
   }
 
-  record(kind: string, detail: unknown): Promise<void> {
+  record(kind: string, detail: unknown, signal?: AbortSignal): Promise<void> {
     const seq = ++this.#seq;
     const ms = Math.max(this.#lastMs, Date.now());
     this.#lastMs = ms;
@@ -75,16 +76,16 @@ class DynamoDbEventLog implements EventLog {
       ...(truncated ? { truncated: true } : {}),
     };
     const write = async () => {
-      const { docs, tableName } = await sessionTable();
-      await withRetries(() =>
-        docs.send(
+      await withRetries(async () => {
+        const { docs, tableName } = await sessionTable();
+        await docs.send(
           new PutCommand({
             TableName: tableName,
             Item: item,
             ConditionExpression: "attribute_not_exists(sk)",
           }),
-        ),
-      );
+        );
+      }, signal);
       printEvent(seq, kind, detail);
     };
     const run = this.#tail.catch(() => undefined).then(write);
@@ -124,20 +125,46 @@ class DynamoDbEventLog implements EventLog {
   }
 }
 
-async function withRetries<T>(operation: () => Promise<T>): Promise<T> {
+/**
+ * Retries one write of a fixed item. Its sk is unique to this writer, so a ConditionalCheckFailed on a retry means an
+ * earlier attempt landed. Without a signal it gives up after 4 attempts; with one it stops only when the signal aborts.
+ */
+export async function withRetries(
+  operation: () => Promise<unknown>,
+  signal?: AbortSignal,
+): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await operation();
+      await operation();
+      return;
     } catch (error) {
-      if (
-        attempt >= 4 ||
-        (error as { name?: string }).name === "ConditionalCheckFailedException"
-      ) {
+      if ((error as { name?: string }).name === "ConditionalCheckFailedException") {
+        if (attempt > 1) return;
         throw error;
       }
-      await new Promise((resolve) => setTimeout(resolve, 50 * 2 ** attempt));
+      if (signal?.aborted) throw signal.reason;
+      if (signal === undefined && attempt >= 4) throw error;
+      const delay = Math.min(50 * 2 ** attempt, 5_000);
+      process.stderr.write(
+        `event log write failed, retrying in ${delay}ms: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      await pause(delay, signal);
     }
   }
+}
+
+function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** The local log for STORAGE_BACKEND=sqlite, which has no shared table. */
@@ -150,7 +177,7 @@ class JsonlEventLog implements EventLog {
     this.#path = path;
   }
 
-  record(kind: string, detail: unknown): Promise<void> {
+  record(kind: string, detail: unknown, signal?: AbortSignal): Promise<void> {
     const write = async () => {
       if (this.#position === undefined) {
         await mkdir(dirname(this.#path), { recursive: true });
@@ -164,7 +191,10 @@ class JsonlEventLog implements EventLog {
         kind,
         detail: detail ?? null,
       };
-      await appendFile(this.#path, `${JSON.stringify(event)}\n`, "utf8");
+      await withRetries(
+        () => appendFile(this.#path, `${JSON.stringify(event)}\n`, "utf8"),
+        signal,
+      );
       printEvent(position, kind, detail);
     };
     const run = this.#tail.catch(() => undefined).then(write);

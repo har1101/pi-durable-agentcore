@@ -214,11 +214,12 @@ function keyed<P extends TSchema>(
         idempotencyKey: key,
       };
       process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
-      await events.record("tool_attempt", {
-        tool: tool.name,
-        idempotencyKey: key,
-        callId: api.callId,
-      });
+      // A transient log failure must not fail the tool, so the record retries until the harness aborts the call.
+      await events.record(
+        "tool_attempt",
+        { tool: tool.name, idempotencyKey: key, callId: api.callId },
+        context.abortSignal,
+      );
       return run(args, key, api, context);
     },
   });
