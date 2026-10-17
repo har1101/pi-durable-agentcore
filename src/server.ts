@@ -3,10 +3,25 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { randomUUID } from "node:crypto";
 import { URL } from "node:url";
 import { SessionFailed } from "@earendil-works/pi-durable";
 import { openEventLog } from "./event-recorder.js";
-import { PiRuntime, sessionDirectory, type ModelMode } from "./runtime.js";
+import {
+  authorizedApprover,
+  parseApprovers,
+  parseInvocation,
+  type Invocation,
+} from "./invocation.js";
+import { approvalIdOf, ParkStore } from "./parks.js";
+import {
+  CLOSED,
+  PiRuntime,
+  sessionDirectory,
+  type Closed,
+  type ModelMode,
+} from "./runtime.js";
+import { LeaseContentionError } from "./storage/errors.js";
 
 const host = process.env.HOST ?? "0.0.0.0";
 const port = Number(process.env.PORT ?? 8080);
@@ -18,6 +33,7 @@ if (configuredMode !== "scripted" && configuredMode !== "bedrock") {
 }
 const modelMode: ModelMode = configuredMode;
 const runtimes = new Map<string, Promise<PiRuntime>>();
+const approvers = parseApprovers(process.env.APPROVER_USER_IDS);
 
 function sessionId(request: IncomingMessage, url?: URL): string {
   const header = request.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
@@ -25,19 +41,40 @@ function sessionId(request: IncomingMessage, url?: URL): string {
   return value ?? url?.searchParams.get("sessionId") ?? "local-session";
 }
 
-async function runtimeFor(id: string): Promise<PiRuntime> {
-  let pending = runtimes.get(id);
-  if (!pending) {
-    pending = PiRuntime.open({
-      stateDirectory,
-      sessionId: id,
-      modelMode,
-      resume: true,
-    });
-    runtimes.set(id, pending);
-    pending.catch(() => runtimes.delete(id));
-  }
+function userId(request: IncomingMessage): string | undefined {
+  const header = request.headers["x-amzn-bedrock-agentcore-runtime-user-id"];
+  return (Array.isArray(header) ? header[0] : header) || undefined;
+}
+
+function runtimeFor(id: string): Promise<PiRuntime> {
+  const existing = runtimes.get(id);
+  if (existing) return existing;
+  const forget = () => {
+    if (runtimes.get(id) === pending) runtimes.delete(id);
+  };
+  const pending: Promise<PiRuntime> = PiRuntime.open({
+    stateDirectory,
+    sessionId: id,
+    modelMode,
+    resume: true,
+    onClosing: forget,
+  });
+  runtimes.set(id, pending);
+  pending.catch(forget);
   return pending;
+}
+
+/** Runs `operation` on an open runtime, opening a fresh one when the current one parked and closed under it. */
+async function withRuntime<T>(
+  id: string,
+  operation: (runtime: PiRuntime) => Promise<T | Closed>,
+): Promise<T> {
+  for (;;) {
+    const runtime = await runtimeFor(id);
+    const result = await operation(runtime);
+    if (result !== CLOSED) return result as T;
+    await runtime.closed;
+  }
 }
 
 function forgetRuntime(id: string): void {
@@ -66,9 +103,7 @@ function json(response: ServerResponse, status: number, body: unknown): void {
   response.end(JSON.stringify(body));
 }
 
-async function body(
-  request: IncomingMessage,
-): Promise<Record<string, unknown>> {
+async function body(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
@@ -78,12 +113,95 @@ async function body(
     chunks.push(buffer);
   }
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
-      string,
-      unknown
-    >;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
   } catch {
     throw new Error("Request body must be valid JSON");
+  }
+}
+
+async function invocation(
+  request: IncomingMessage,
+  response: ServerResponse,
+  command: Invocation,
+): Promise<void> {
+  const id = sessionId(request);
+  switch (command.action) {
+    case "invoke": {
+      const requestId = command.requestId ?? randomUUID();
+      const caller = userId(request);
+      const input = {
+        prompt: command.prompt,
+        requestId,
+        ...(caller !== undefined ? { userId: caller } : {}),
+      };
+      json(response, 200, await withRuntime(id, (runtime) => runtime.invoke(input)));
+      return;
+    }
+    case "decide": {
+      const approver = authorizedApprover(userId(request), approvers);
+      if (approver === undefined) {
+        response.setHeader("x-amzn-ErrorType", "AccessDeniedException");
+        json(response, 403, { message: "caller is not an approver" });
+        return;
+      }
+      const outcome = await new ParkStore(id).decide(
+        command.approval,
+        command.decision,
+        approver,
+        Date.now(),
+      );
+      switch (outcome.kind) {
+        case "unknown":
+          json(response, 404, { status: "error", reason: "unknown_approval" });
+          return;
+        case "self_approval":
+          response.setHeader("x-amzn-ErrorType", "AccessDeniedException");
+          json(response, 403, { message: "the requester cannot decide" });
+          return;
+        case "already_decided":
+        case "expired":
+          json(response, 409, {
+            status: "error",
+            reason: outcome.kind,
+            decision: outcome.park.decided!.decision,
+            decidedBy: outcome.park.decided!.by,
+          });
+          return;
+        case "recorded":
+        case "duplicate": {
+          if (outcome.kind === "recorded") {
+            await openEventLog({
+              sessionId: id,
+              sessionPath: sessionDirectory(stateDirectory, id),
+            }).record("approval_decided", {
+              approvalId: approvalIdOf(outcome.park.id),
+              decision: command.decision,
+              decidedBy: approver,
+            });
+          }
+          try {
+            const park = outcome.park;
+            json(response, 200, await withRuntime(id, (runtime) => runtime.deliver(park)));
+          } catch (error) {
+            if (!(error instanceof LeaseContentionError)) throw error;
+            json(response, 202, { status: "accepted", decision: command.decision });
+          }
+          return;
+        }
+      }
+      return;
+    }
+    case "resume": {
+      try {
+        const status = await (await runtimeFor(id)).resume();
+        if (status === "idle") json(response, 200, { status });
+        else json(response, 202, { status: "accepted" });
+      } catch (error) {
+        if (!(error instanceof LeaseContentionError)) throw error;
+        json(response, 409, { status: "busy" });
+      }
+      return;
+    }
   }
 }
 
@@ -104,28 +222,13 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/invocations") {
-      const input = await body(request);
-      if (typeof input.prompt !== "string" || input.prompt.trim() === "") {
+      const parsed = parseInvocation(await body(request));
+      if (!parsed.ok) {
         response.setHeader("x-amzn-ErrorType", "ValidationException");
-        json(response, 400, { message: "prompt must be a non-empty string" });
+        json(response, 400, { message: parsed.message });
         return;
       }
-      if (
-        input.requestId !== undefined &&
-        typeof input.requestId !== "string"
-      ) {
-        response.setHeader("x-amzn-ErrorType", "ValidationException");
-        json(response, 400, { message: "requestId must be a string" });
-        return;
-      }
-      const runtime = await runtimeFor(sessionId(request));
-      const result = await runtime.invoke({
-        prompt: input.prompt,
-        ...(typeof input.requestId === "string"
-          ? { requestId: input.requestId }
-          : {}),
-      });
-      json(response, 200, result);
+      await invocation(request, response, parsed.invocation);
       return;
     }
 
