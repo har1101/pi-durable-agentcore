@@ -64,7 +64,7 @@ export interface ParkRecord {
   /** The placed submission whose run made the call; decide reports its result. */
   readonly submissionId?: number;
   readonly requestId?: string;
-  /** User id of the invoke that started the run, when this process saw it. That user cannot approve. */
+  /** User id of the invoke that started the run, from its input entry; absent for an anonymous invoke. That user cannot approve. */
   readonly requestedBy?: string;
   readonly decided?: {
     readonly decision: Decision;

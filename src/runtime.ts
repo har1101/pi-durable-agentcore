@@ -29,6 +29,7 @@ import {
   watchEvents,
   type AgentEventStream,
   type Conversation,
+  type EntryRecord,
   type HarnessInspection,
   type HookApi,
   type SettledSubmissionRecord,
@@ -133,9 +134,14 @@ function textOf(content: unknown): string {
     .join("");
 }
 
-/** The scripted model's one tool call per prompt, so one server can run every scenario. */
+/** `[approval xN]` makes N gated calls in one run; every other prompt makes one call. */
+function scriptedCalls(prompt: string): number {
+  return Number(/\[approval x(\d+)\]/.exec(prompt)?.[1] ?? 1);
+}
+
+/** The scripted model's tool call for a prompt, so one server can run every scenario. */
 function scriptedCall(prompt: string, callCount: number) {
-  if (prompt.includes("[approval]")) {
+  if (prompt.includes("[approval")) {
     return { name: "publish_report", args: { title: "Q3" }, id: `publish-report-${callCount}` };
   }
   const wait = /\[wait (\d+(?:\.\d+)?)\]/.exec(prompt);
@@ -162,10 +168,12 @@ async function scriptedResponse(
   const lastUser = transcript.messages.findLastIndex(
     (message) => message.role === "user",
   );
-  const result = transcript.messages
+  const prompt = textOf(transcript.messages[lastUser]?.content);
+  const results = transcript.messages
     .slice(lastUser + 1)
-    .find((message) => message.role === "toolResult");
-  if (result?.role === "toolResult") {
+    .filter((message) => message.role === "toolResult");
+  const result = results.at(-1);
+  if (result?.role === "toolResult" && results.length >= scriptedCalls(prompt)) {
     return fauxAssistantMessage([
       fauxText(
         result.toolName === "durable_wait"
@@ -174,10 +182,7 @@ async function scriptedResponse(
       ),
     ]);
   }
-  const call = scriptedCall(
-    textOf(transcript.messages[lastUser]?.content),
-    state.callCount,
-  );
+  const call = scriptedCall(prompt, state.callCount);
   return fauxAssistantMessage(
     [fauxToolCall(call.name, call.args, { id: call.id })],
     { stopReason: "toolUse" },
@@ -277,6 +282,18 @@ function liveness(
     : "running";
 }
 
+/**
+ * The entry an input with a known caller is placed as, carrying that caller. pi-durable keeps the first submission of a
+ * requestId and ignores a re-sent draft, so the requester is fixed by the first invoke and survives reopen and crash.
+ */
+const REQUESTED_INPUT = "poc.requested-input";
+
+function requesterOf(entry: EntryRecord | undefined): string | undefined {
+  if (entry?.kind !== REQUESTED_INPUT) return undefined;
+  const requestedBy = (entry.data as { requestedBy?: unknown } | undefined)?.requestedBy;
+  return typeof requestedBy === "string" ? requestedBy : undefined;
+}
+
 function report(events: EventLog, error: unknown): void {
   events
     .record("harness_error", {
@@ -343,8 +360,6 @@ export class PiRuntime {
   readonly #onClosing: (() => void) | undefined;
   /** Gates waiting in memory on their PARK, by tool task id; each entry wakes its gate to re-read the PARK. */
   readonly #parked = new Map<number, () => void>();
-  /** requestId → user id of the invoke that submitted it, for this process only. */
-  readonly #requesters = new Map<string, string>();
   #holds = 0;
   /** The current drive; `armed` resolves once its RUN item is armed. */
   #drive: { readonly armed: Promise<void> } | undefined;
@@ -558,14 +573,20 @@ export class PiRuntime {
     let submission: Submission;
     this.#holds++;
     try {
-      if (input.userId !== undefined) this.#requesters.set(requestId, input.userId);
       await this.events.record("invocation_started", {
         requestId,
         prompt: input.prompt,
       });
       await this.#ensureDriving();
       submission = await this.root.submit(
-        { type: "input", content: input.prompt, requestId },
+        {
+          type: "input",
+          content: input.prompt,
+          requestId,
+          ...(input.userId !== undefined
+            ? { entry: { kind: REQUESTED_INPUT, data: { requestedBy: input.userId } } }
+            : {}),
+        },
         context,
       );
     } finally {
@@ -805,10 +826,18 @@ export class PiRuntime {
       const placed = (await this.harness.inspect(hookContext)).submissions.find(
         (submission) => submission.type === "input" && submission.status === "placed",
       );
-      const requestedBy =
-        placed?.requestId !== undefined
-          ? this.#requesters.get(placed.requestId)
-          : undefined;
+      const input =
+        placed?.entry === undefined
+          ? undefined
+          : (
+              await this.root.entries(
+                { minEntryId: placed.entry, maxEntryId: placed.entry },
+                1,
+                undefined,
+                hookContext,
+              )
+            ).items[0];
+      const requestedBy = requesterOf(input);
       const now = Date.now();
       return parks.ensure(id, {
         kind: spec.kind,

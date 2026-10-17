@@ -190,6 +190,43 @@ describe("human approval that leaves the process", () => {
     expect(other.body).toMatchObject({ status: "success" });
   });
 
+  it("keeps the requester on a second gated call of the run after the runtime reopened", async () => {
+    const { server, sessionId } = await setup();
+    const invoke = { prompt: "Publish twice [approval x2]", requestId: "r-twice" };
+    const first = await post(server, sessionId, invoke, as("alice"));
+    const [p1] = first.body.pending as Array<{ approvalId: string }>;
+
+    const next = await decide(server, sessionId, p1!.approvalId, "approve", "bob");
+    expect(next.body).toMatchObject({ status: "pending", requestId: "r-twice" });
+    const pending = next.body.pending as Array<{ approvalId: string }>;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.approvalId).not.toBe(p1!.approvalId);
+
+    const self = await decide(server, sessionId, pending[0]!.approvalId, "approve", "alice");
+    expect(self.status).toBe(403);
+    const other = await decide(server, sessionId, pending[0]!.approvalId, "approve", "bob");
+    expect(other.body).toMatchObject({ status: "success", response: "Finished: published Q3" });
+    expect(count(await events(server, sessionId), "gated_action")).toBe(2);
+  });
+
+  it("keeps the first requester when another user re-sends the requestId on a fresh process", async () => {
+    const { scenario, server: first, sessionId } = await setup();
+    const invoke = { prompt: "Publish twice [approval x2]", requestId: "r-twice" };
+    const original = await post(first, sessionId, invoke, as("alice"));
+    const [p1] = original.body.pending as Array<{ approvalId: string }>;
+    await first.kill("SIGKILL");
+
+    const second = await scenario.server(APPROVERS);
+    const resent = await post(second, sessionId, invoke, as("bob"));
+    expect(resent.body).toMatchObject({ status: "pending", pending: original.body.pending });
+
+    const next = await decide(second, sessionId, p1!.approvalId, "approve", "bob");
+    const [p2] = next.body.pending as Array<{ approvalId: string }>;
+    expect((await decide(second, sessionId, p2!.approvalId, "approve", "alice")).status).toBe(403);
+    const approved = await decide(second, sessionId, p2!.approvalId, "approve", "bob");
+    expect(approved.body).toMatchObject({ status: "success", requestId: "r-twice" });
+  });
+
   it("lets the deadline win over a late approval", async () => {
     const { server, sessionId } = await setup({ PI_APPROVAL_TIMEOUT_MS: "1500" });
     const reply = await post(
