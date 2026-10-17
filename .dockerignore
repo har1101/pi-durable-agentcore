@@ -1,0 +1,8 @@
+.git
+.github
+.demo-state
+coverage
+dist
+node_modules
+media
+*.log

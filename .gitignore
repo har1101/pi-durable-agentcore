@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.demo-state/
+.dynamodb-local/
+*.tgz
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
