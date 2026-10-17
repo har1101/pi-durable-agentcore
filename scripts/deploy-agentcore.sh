@@ -19,8 +19,8 @@ if [[ "$approver_user_ids" == *[\"\\]* ]]; then
   echo "APPROVER_USER_IDS must not contain quotes or backslashes" >&2
   exit 1
 fi
-if [[ ! "$approval_timeout_ms" =~ ^[0-9]+$ ]]; then
-  echo "PI_APPROVAL_TIMEOUT_MS must be a whole number of milliseconds" >&2
+if [[ ! "$approval_timeout_ms" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PI_APPROVAL_TIMEOUT_MS must be a positive whole number of milliseconds" >&2
   exit 1
 fi
 lifecycle='{"idleRuntimeSessionTimeout":28800,"maxLifetime":28800}'

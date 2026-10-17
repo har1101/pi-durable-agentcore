@@ -45,6 +45,7 @@ import {
   createConfiguredAmazonBedrockProvider,
 } from "./bedrock-provider.js";
 import { openEventLog, type EventLog } from "./event-recorder.js";
+import { parseApprovalTimeout } from "./invocation.js";
 import {
   approvalIdOf,
   parkIdOf,
@@ -111,14 +112,14 @@ export function sessionDirectory(
   return join(stateDirectory, "sessions", digest);
 }
 
+/** Parsed when the module loads, so a bad value stops the process at startup instead of failing gated calls. */
+const APPROVAL_TIMEOUT_MS = parseApprovalTimeout(process.env.PI_APPROVAL_TIMEOUT_MS);
+
 /** Tools that wait before they may start, and for what. Tool bodies know nothing about it. */
 const GATES: Readonly<
   Record<string, (args: Readonly<Record<string, unknown>>, now: number) => ParkSpec>
 > = {
-  publish_report: () => ({
-    kind: "approval",
-    timeoutMs: Number(process.env.PI_APPROVAL_TIMEOUT_MS ?? 86_400_000),
-  }),
+  publish_report: () => ({ kind: "approval", timeoutMs: APPROVAL_TIMEOUT_MS }),
   wait_until: (args, now) => ({
     kind: "timer",
     until: now + 1000 * Number(args.seconds),

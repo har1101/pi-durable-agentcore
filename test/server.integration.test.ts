@@ -35,3 +35,11 @@ describe("server health", () => {
     expect(await ping(waiter)).toBe("Healthy");
   });
 });
+
+describe("server startup", () => {
+  it("refuses to start with an invalid PI_APPROVAL_TIMEOUT_MS", async () => {
+    await expect(scenario().server({ PI_APPROVAL_TIMEOUT_MS: "0" })).rejects.toThrow(
+      /PI_APPROVAL_TIMEOUT_MS must be a positive integer of milliseconds, got "0"/,
+    );
+  });
+});

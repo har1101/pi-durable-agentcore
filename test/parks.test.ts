@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   authorizedApprover,
+  parseApprovalTimeout,
   parseApprovers,
   parseInvocation,
 } from "../dist/invocation.js";
@@ -127,5 +128,20 @@ describe("approvers", () => {
     expect(authorizedApprover(undefined, approvers)).toBeUndefined();
     expect(authorizedApprover("timeout", approvers)).toBeUndefined();
     expect(authorizedApprover("alice", parseApprovers(undefined))).toBeUndefined();
+  });
+});
+
+describe("PI_APPROVAL_TIMEOUT_MS", () => {
+  it("defaults to one day and accepts a positive integer", () => {
+    expect(parseApprovalTimeout(undefined)).toBe(86_400_000);
+    expect(parseApprovalTimeout("1500")).toBe(1500);
+  });
+
+  it("refuses anything that is not a positive integer of milliseconds", () => {
+    for (const value of ["", "0", "-1", "1.5", "1e3", " 10", "abc", "9007199254740993"]) {
+      expect(() => parseApprovalTimeout(value), JSON.stringify(value)).toThrow(
+        /PI_APPROVAL_TIMEOUT_MS must be a positive integer/,
+      );
+    }
   });
 });

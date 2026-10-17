@@ -72,6 +72,18 @@ export function parseApprovers(value: string | undefined): ReadonlySet<string> {
   );
 }
 
+/** PI_APPROVAL_TIMEOUT_MS: unset means one day; anything else must be a positive integer of milliseconds. */
+export function parseApprovalTimeout(value: string | undefined): number {
+  if (value === undefined) return 86_400_000;
+  const ms = Number(value);
+  if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(ms)) {
+    throw new Error(
+      `PI_APPROVAL_TIMEOUT_MS must be a positive integer of milliseconds, got ${JSON.stringify(value)}`,
+    );
+  }
+  return ms;
+}
+
 /** The approver's user id, or undefined when the caller may not decide. */
 export function authorizedApprover(
   userId: string | undefined,
