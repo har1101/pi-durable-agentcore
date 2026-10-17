@@ -632,6 +632,7 @@ export class PiRuntime {
       if (this.#closing) return CLOSED;
       throw error;
     }
+    if (this.#closing) return CLOSED;
     await this.#ensureDriving();
     return "accepted";
   }

@@ -33,6 +33,8 @@ if (configuredMode !== "scripted" && configuredMode !== "bedrock") {
 }
 const modelMode: ModelMode = configuredMode;
 const runtimes = new Map<string, Promise<PiRuntime>>();
+const OPENING_STATE = Symbol("opening");
+const OPENING = Promise.resolve(OPENING_STATE);
 const approvers = parseApprovers(process.env.APPROVER_USER_IDS);
 
 function sessionId(request: IncomingMessage, url?: URL): string {
@@ -64,17 +66,25 @@ function runtimeFor(id: string): Promise<PiRuntime> {
   return pending;
 }
 
+const REOPEN_ATTEMPTS = 3;
+
+/** The session kept parking and closing under the request; the caller may retry. */
+class RuntimeUnavailable extends Error {}
+
 /** Runs `operation` on an open runtime, opening a fresh one when the current one parked and closed under it. */
 async function withRuntime<T>(
   id: string,
   operation: (runtime: PiRuntime) => Promise<T | Closed>,
 ): Promise<T> {
-  for (;;) {
+  for (let attempt = 0; attempt < REOPEN_ATTEMPTS; attempt++) {
     const runtime = await runtimeFor(id);
     const result = await operation(runtime);
     if (result !== CLOSED) return result as T;
     await runtime.closed;
   }
+  throw new RuntimeUnavailable(
+    `Session ${id} closed under the request ${REOPEN_ATTEMPTS} times; retry`,
+  );
 }
 
 function forgetRuntime(id: string): void {
@@ -193,9 +203,8 @@ async function invocation(
     }
     case "resume": {
       try {
-        const status = await (await runtimeFor(id)).resume();
-        if (status === "idle") json(response, 200, { status });
-        else json(response, 202, { status: "accepted" });
+        const status = await withRuntime(id, (runtime) => runtime.resume());
+        json(response, status === "idle" ? 200 : 202, { status });
       } catch (error) {
         if (!(error instanceof LeaseContentionError)) throw error;
         json(response, 409, { status: "busy" });
@@ -212,12 +221,15 @@ const server = createServer(async (request, response) => {
   );
   try {
     if (request.method === "GET" && url.pathname === "/ping") {
-      const values = await Promise.all([...runtimes.values()]);
-      json(response, 200, {
-        status: values.some((runtime) => runtime.busy)
-          ? "HealthyBusy"
-          : "Healthy",
-      });
+      // An open that already settled wins the race against OPENING, so only an open still in progress reads as one.
+      const states = await Promise.allSettled(
+        [...runtimes.values()].map((pending) => Promise.race([pending, OPENING])),
+      );
+      const busy = states.some(
+        (state) =>
+          state.status === "fulfilled" && (state.value === OPENING_STATE || state.value.busy),
+      );
+      json(response, 200, { status: busy ? "HealthyBusy" : "Healthy" });
       return;
     }
 
@@ -257,6 +269,11 @@ const server = createServer(async (request, response) => {
     json(response, 404, { message: "Not found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof RuntimeUnavailable) {
+      response.setHeader("x-amzn-ErrorType", "RetryableConflictException");
+      json(response, 503, { message });
+      return;
+    }
     const stack = error instanceof Error ? error.stack : undefined;
     if (isFailedSessionError(error)) {
       forgetRuntime(sessionId(request, url));

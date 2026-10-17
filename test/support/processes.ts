@@ -150,7 +150,7 @@ export function count(list: readonly RecordedEvent[], kind: string): number {
 }
 
 export async function ping(server: ServerProcess): Promise<string> {
-  const response = await fetch(`${server.base}/ping`);
+  const response = await fetch(`${server.base}/ping`, { signal: AbortSignal.timeout(2_000) });
   return ((await response.json()) as { status: string }).status;
 }
 
