@@ -227,6 +227,27 @@ describe("human approval that leaves the process", () => {
     expect(approved.body).toMatchObject({ status: "success", requestId: "r-twice" });
   });
 
+  it("lists only this request's parked calls when its input is queued behind another run's approval", async () => {
+    const { server, sessionId } = await setup();
+    const approvalId = await requestApproval(server, sessionId);
+    const queued = await post(
+      server,
+      sessionId,
+      { prompt: "Queued behind the approval.", requestId: "r-queued" },
+      as("carol"),
+    );
+    expect(queued.body).toEqual({
+      response: "Waiting for the session to resume",
+      requestId: "r-queued",
+      sessionId,
+      status: "pending",
+      pending: [],
+    });
+
+    const approved = await decide(server, sessionId, approvalId, "approve");
+    expect(approved.body).toMatchObject({ status: "success", requestId: "r-approval" });
+  });
+
   it("lets the deadline win over a late approval", async () => {
     const { server, sessionId } = await setup({ PI_APPROVAL_TIMEOUT_MS: "1500" });
     const reply = await post(

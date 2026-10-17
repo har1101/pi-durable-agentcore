@@ -53,6 +53,7 @@ import {
   toolKey,
   verdictOf,
   type IdempotencyKey,
+  type ParkId,
   type ParkRecord,
   type ParkSpec,
 } from "./parks.js";
@@ -616,7 +617,7 @@ export class PiRuntime {
     if (submission === undefined) {
       throw new Error(`Submission ${park.submissionId} is unknown`);
     }
-    return this.#resultOf(submission, park.requestId ?? "");
+    return this.#resultOf(submission, park.requestId ?? "", park.id);
   }
 
   /** Drives whatever the open left unsettled. CLOSED means it ran and parked again. */
@@ -740,9 +741,11 @@ export class PiRuntime {
     return this.#closed;
   }
 
+  /** `decided`: the PARK a decide stored, which a parked close must not leave unapplied. */
   async #resultOf(
     submission: Submission,
     requestId: string,
+    decided?: ParkId,
   ): Promise<InvokeResult | Closed> {
     let settled: SettledSubmissionRecord;
     try {
@@ -750,7 +753,11 @@ export class PiRuntime {
     } catch (error) {
       if (this.#closing !== "parked") throw error;
       await this.closed;
-      return this.#pendingResult(requestId);
+      // Its gate parked on a read from before the decision: a fresh runtime applies it instead of answering pending.
+      if (decided !== undefined && (await this.#parks!.mustGet(decided)).consumedAt === undefined) {
+        return CLOSED;
+      }
+      return this.#pendingResult(submission.id, requestId);
     }
     if (settled.status === "unanswered" || settled.type !== "input") {
       const payload = unansweredPayload(settled);
@@ -789,10 +796,16 @@ export class PiRuntime {
     };
   }
 
-  async #pendingResult(requestId: string): Promise<InvokeResult> {
+  /** Lists only this submission's parked calls; an input queued behind another run's park lists none. */
+  async #pendingResult(
+    submissionId: SubmissionId,
+    requestId: string,
+  ): Promise<InvokeResult> {
     const now = Date.now();
     const pending = (await this.#parks!.open())
-      .filter((park) => verdictOf(park, now) === "pending")
+      .filter(
+        (park) => park.submissionId === submissionId && verdictOf(park, now) === "pending",
+      )
       .map(pendingItem);
     await this.events.record("invocation_pending", {
       requestId,
@@ -801,7 +814,9 @@ export class PiRuntime {
     return {
       response: pending.some((item) => item.kind === "approval")
         ? "Waiting for approval"
-        : "Waiting for timer",
+        : pending.length > 0
+          ? "Waiting for timer"
+          : "Waiting for the session to resume",
       requestId,
       sessionId: this.sessionId,
       status: "pending",
