@@ -43,7 +43,8 @@ node "$repo_root/dist/demo-worker.js" resume \
   --session-id "$session_id" \
   --delay-ms 50 >"$resume_log" 2>&1
 
-attempts="$(find "$state_dir/sessions" -name tool-attempts.jsonl -exec wc -l {} \; | awk '{sum += $1} END {print sum + 0}')"
+# Tool attempts live in the DynamoDB event log, not on the (replaceable) local disk.
+attempts="$(node "$repo_root/dist/events-cli.js" count --session-id "$session_id" --kind tool_attempt)"
 grep -q "resume_called" "$resume_log"
 grep -q "DEMO_RESULT" "$resume_log"
 grep -q '"storage":"dynamodb"' "$resume_log"

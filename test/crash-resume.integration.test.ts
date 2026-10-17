@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  readDynamoDbEvents,
+  sessionTableClient,
+  sessionTableName,
+} from "../src/event-log.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -49,6 +54,23 @@ describe("real process integration against DynamoDB Local", () => {
     expect(resumedLog).toContain(
       "Finished after the durable tool checkpoint was committed.",
     );
+
+    // The tool attempts are in DynamoDB, not on the killed process's disk,
+    // and the replayed attempt carries the same idempotency key.
+    const attempts = (
+      await readDynamoDbEvents(
+        await sessionTableClient(),
+        sessionTableName(),
+        sessionId,
+      )
+    ).filter((event) => event.kind === "tool_attempt");
+    expect(attempts).toHaveLength(2);
+    expect(new Set(attempts.map((event) => event.pid)).size).toBe(2);
+    const keys = attempts.map(
+      (event) => (event.detail as { idempotencyKey: string }).idempotencyKey,
+    );
+    expect(keys[0]).toMatch(/^tk_[0-9a-f]{64}$/);
+    expect(keys[1]).toBe(keys[0]);
   }, 50_000);
 
   it("serves the AgentCore HTTP contract with DynamoDB Local", async () => {
@@ -121,6 +143,9 @@ describe("real process integration against DynamoDB Local", () => {
       expect(
         eventBody.events.some((event) => event.kind === "checkpoint_committed"),
       ).toBe(true);
+      expect(
+        eventBody.events.filter((event) => event.kind === "tool_attempt"),
+      ).toHaveLength(1);
       expect(
         eventBody.events.some(
           (event) =>
