@@ -156,6 +156,8 @@ One in-place add:
 Do **not** replace OIDC, roles, ECR, or DynamoDB. Every parameter keeps its
 previous value. Do not run AWS from this agent.
 
+Fukuchi applied **700ace3**: stack **UPDATE_COMPLETE**. Retrigger GHA deploy.
+
 ```bash
 aws cloudformation update-stack \
   --profile fukuchi \
