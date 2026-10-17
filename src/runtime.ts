@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
@@ -30,8 +30,8 @@ import {
   applyBedrockRuntimeEnv,
   createConfiguredAmazonBedrockProvider,
 } from "./bedrock-provider.js";
-import { EventRecorder } from "./event-recorder.js";
-import { openSessionStorage } from "./storage/open.js";
+import type { EventLog } from "./event-log.js";
+import { openSessionBackend } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -59,7 +59,10 @@ export interface InvokeResult {
   detail?: unknown;
 }
 
-function sessionDirectory(stateDirectory: string, sessionId: string): string {
+export function sessionDirectory(
+  stateDirectory: string,
+  sessionId: string,
+): string {
   const digest = createHash("sha256").update(sessionId).digest("hex");
   return join(stateDirectory, "sessions", digest);
 }
@@ -146,7 +149,7 @@ function assistantText(message: AssistantMessage | undefined): string {
 export class PiRuntime {
   readonly sessionId: string;
   readonly sessionPath: string;
-  readonly recorder: EventRecorder;
+  readonly recorder: EventLog;
   readonly root: Conversation;
   readonly harness: Harness;
   #events: AgentEventStream;
@@ -155,7 +158,7 @@ export class PiRuntime {
   private constructor(
     sessionId: string,
     sessionPath: string,
-    recorder: EventRecorder,
+    recorder: EventLog,
     harness: Harness,
     root: Conversation,
     events: AgentEventStream,
@@ -172,10 +175,11 @@ export class PiRuntime {
     const modelMode = options.modelMode ?? "scripted";
     const path = sessionDirectory(options.stateDirectory, options.sessionId);
     await mkdir(path, { recursive: true });
-    const recorder = await EventRecorder.open(
-      join(path, "events.jsonl"),
-      options.sessionId,
-    );
+    const opened = await openSessionBackend({
+      sessionId: options.sessionId,
+      sessionPath: path,
+    });
+    const recorder = opened.events;
     const models = createModels();
     let bedrockAuthSource: string | undefined;
 
@@ -208,7 +212,6 @@ export class PiRuntime {
     const delayMs =
       options.scriptedDelayMs ??
       Number(process.env.SCRIPTED_TOOL_DELAY_MS ?? 5_000);
-    const attemptsPath = join(path, "tool-attempts.jsonl");
     const waitTool = defineTool({
       name: "durable_wait",
       description:
@@ -223,7 +226,7 @@ export class PiRuntime {
           sessionId: options.sessionId,
         };
         process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
-        await appendFile(attemptsPath, `${JSON.stringify(attempt)}\n`, "utf8");
+        await recorder.record("tool_attempt", attempt);
         await recorder.record("tool_call_started", {
           name: "durable_wait",
           label,
@@ -250,10 +253,6 @@ export class PiRuntime {
       }),
     );
 
-    const opened = await openSessionStorage({
-      sessionId: options.sessionId,
-      sessionPath: path,
-    });
     const harness = await Harness.open(
       opened.storage,
       {
@@ -361,15 +360,6 @@ export class PiRuntime {
       };
     } finally {
       this.#busy--;
-    }
-  }
-
-  async readEvents(): Promise<string> {
-    try {
-      return await readFile(this.recorder.path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
-      throw error;
     }
   }
 

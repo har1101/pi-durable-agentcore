@@ -1,15 +1,17 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { cleanupTemporaryDirectories, startServer } from "./support/server.js";
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  await cleanupTemporaryDirectories();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -53,84 +55,57 @@ describe("real process integration against DynamoDB Local", () => {
 
   it("serves the AgentCore HTTP contract with DynamoDB Local", async () => {
     expect(process.env.DYNAMODB_ENDPOINT).toMatch(/^http:\/\//);
-    const state = await mkdtemp(join(tmpdir(), "pi-agentcore-http-"));
-    temporaryDirectories.push(state);
-    const port = 20_000 + Math.floor(Math.random() * 10_000);
     const sessionId = `http-${randomUUID()}`;
-    const child = spawn(process.execPath, ["dist/server.js"], {
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        HOST: "127.0.0.1",
-        PORT: String(port),
-        STATE_DIRECTORY: state,
-        MODEL_PROVIDER: "scripted",
-        SCRIPTED_TOOL_DELAY_MS: "10",
-        STORAGE_BACKEND: "dynamodb",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    child.stdout.on("data", (chunk) => {
-      output += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      output += String(chunk);
-    });
-
+    const server = await startServer(sessionId);
     try {
-      for (let attempt = 0; attempt < 100; attempt++) {
-        if (output.includes("listening on")) break;
-        if (child.exitCode !== null)
-          throw new Error(`server exited:\n${output}`);
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-
-      const ping = await fetch(`http://127.0.0.1:${port}/ping`);
+      const ping = await fetch(`http://127.0.0.1:${server.port}/ping`);
       expect(ping.status).toBe(200);
       expect(await ping.json()).toEqual({ status: "Healthy" });
 
-      const invocation = await fetch(`http://127.0.0.1:${port}/invocations`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": sessionId,
-        },
-        body: JSON.stringify({
-          prompt: "Exercise the HTTP contract.",
-          requestId: "http-integration",
-        }),
+      const invocation = await server.invoke({
+        prompt: "Exercise the HTTP contract.",
+        requestId: "http-integration",
       });
       expect(invocation.status).toBe(200);
-      expect(await invocation.json()).toMatchObject({
+      expect(invocation.body).toMatchObject({
         response: "Finished after the durable tool checkpoint was committed.",
         requestId: "http-integration",
         sessionId,
         status: "success",
       });
 
-      const events = await fetch(
-        `http://127.0.0.1:${port}/events?sessionId=${sessionId}`,
-      );
-      const eventBody = (await events.json()) as {
-        events: Array<{ kind: string; detail?: { storage?: string } }>;
-      };
+      const events = await server.events();
+      expect(events.some((event) => event.kind === "tool_call_started")).toBe(true);
+      expect(events.some((event) => event.kind === "checkpoint_committed")).toBe(true);
       expect(
-        eventBody.events.some((event) => event.kind === "tool_call_started"),
-      ).toBe(true);
-      expect(
-        eventBody.events.some((event) => event.kind === "checkpoint_committed"),
-      ).toBe(true);
-      expect(
-        eventBody.events.some(
+        events.some(
           (event) =>
-            event.kind === "runtime_opened" &&
-            event.detail?.storage === "dynamodb",
+            event.kind === "runtime_opened" && event.detail?.storage === "dynamodb",
         ),
       ).toBe(true);
     } finally {
-      child.kill("SIGTERM");
-      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      await server.kill("SIGTERM");
+    }
+  });
+
+  it("serves /events of a SIGKILLed process from a replacement process", async () => {
+    const sessionId = `events-${randomUUID()}`;
+    const first = await startServer(sessionId);
+    await first.invoke({ prompt: "Leave durable events.", requestId: "events-1" });
+    const firstPid = first.child.pid;
+    await first.kill("SIGKILL");
+
+    const replacement = await startServer(sessionId);
+    try {
+      const events = await replacement.events();
+      const attempts = events.filter((event) => event.kind === "tool_attempt");
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.pid).toBe(firstPid);
+      const positions = events.map((event: any) => event.position as number);
+      expect(positions).toEqual(positions.map((_, index) => index + 1));
+      expect(events.every((event) => event.pid === firstPid)).toBe(true);
+    } finally {
+      await replacement.kill("SIGTERM");
     }
   });
 });
