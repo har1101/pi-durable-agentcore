@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { describe, expect, it } from "vitest";
-import { openDynamoDbStorage } from "../src/storage/dynamodb.js";
+import { openDynamoDbStorage } from "../dist/storage/dynamodb.js";
 
 const tableName = process.env.DYNAMODB_TABLE ?? "pi-durable-agentcore-sessions";
 

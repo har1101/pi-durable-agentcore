@@ -8,6 +8,7 @@ import {
   ResourceInUseException,
   ResourceNotFoundException,
   TransactionCanceledException,
+  UpdateTableCommand,
   waitUntilTableExists,
   type DynamoDBClientConfig,
 } from "@aws-sdk/client-dynamodb";
@@ -41,6 +42,7 @@ import {
   type TaskId,
   type TaskQuery,
 } from "@earendil-works/pi-durable";
+import { WAKE_INDEX } from "../wake-sweeper.cjs";
 import { FencedWriterError, LeaseContentionError } from "./errors.js";
 
 const LEASE_SK = "LEASE";
@@ -178,6 +180,21 @@ export async function ensureSessionTable(
   } = {},
 ): Promise<void> {
   const lowLevel = new DynamoDBClient(dynamoDbClientConfig(options));
+  const wakeAttributes = [
+    { AttributeName: "wakeShard", AttributeType: "S" as const },
+    { AttributeName: "wakeAt", AttributeType: "N" as const },
+  ];
+  const wakeIndex = {
+    IndexName: WAKE_INDEX,
+    KeySchema: [
+      { AttributeName: "wakeShard", KeyType: "HASH" as const },
+      { AttributeName: "wakeAt", KeyType: "RANGE" as const },
+    ],
+    Projection: {
+      ProjectionType: "INCLUDE" as const,
+      NonKeyAttributes: ["runtimeSessionId"],
+    },
+  };
   try {
     await lowLevel.send(
       new CreateTableCommand({
@@ -186,11 +203,13 @@ export async function ensureSessionTable(
         AttributeDefinitions: [
           { AttributeName: "pk", AttributeType: "S" },
           { AttributeName: "sk", AttributeType: "S" },
+          ...wakeAttributes,
         ],
         KeySchema: [
           { AttributeName: "pk", KeyType: "HASH" },
           { AttributeName: "sk", KeyType: "RANGE" },
         ],
+        GlobalSecondaryIndexes: [wakeIndex],
       }),
     );
   } catch (error) {
@@ -200,11 +219,40 @@ export async function ensureSessionTable(
     { client: lowLevel, maxWaitTime: 30 },
     { TableName: tableName },
   );
-  const described = await lowLevel.send(
+  let described = await lowLevel.send(
     new DescribeTableCommand({ TableName: tableName }),
   );
-  if (described.Table?.TableStatus !== "ACTIVE") {
-    throw new Error(`DynamoDB table ${tableName} is not ACTIVE`);
+  if (
+    !described.Table?.GlobalSecondaryIndexes?.some(
+      (index) => index.IndexName === WAKE_INDEX,
+    )
+  ) {
+    try {
+      await lowLevel.send(
+        new UpdateTableCommand({
+          TableName: tableName,
+          AttributeDefinitions: wakeAttributes,
+          GlobalSecondaryIndexUpdates: [{ Create: wakeIndex }],
+        }),
+      );
+    } catch (error) {
+      // A concurrent ensure already added it.
+      if (!(error instanceof ResourceInUseException)) throw error;
+    }
+  }
+  for (let attempt = 0; ; attempt++) {
+    const table = described.Table;
+    const index = table?.GlobalSecondaryIndexes?.find(
+      (candidate) => candidate.IndexName === WAKE_INDEX,
+    );
+    if (table?.TableStatus === "ACTIVE" && index?.IndexStatus === "ACTIVE") return;
+    if (attempt >= 300) {
+      throw new Error(`DynamoDB table ${tableName} or ${WAKE_INDEX} is not ACTIVE`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    described = await lowLevel.send(
+      new DescribeTableCommand({ TableName: tableName }),
+    );
   }
 }
 

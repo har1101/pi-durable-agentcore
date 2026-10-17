@@ -337,7 +337,8 @@ export class PiRuntime {
   /** requestId → user id of the invoke that submitted it, for this process only. */
   readonly #requesters = new Map<string, string>();
   #holds = 0;
-  #drive: Promise<void> | undefined;
+  /** The current drive; `armed` resolves once its RUN item is armed. */
+  #drive: { readonly armed: Promise<void> } | undefined;
   #closing: "parked" | "closed" | undefined;
   #closed: Promise<void> | undefined;
   #change = Promise.withResolvers<void>();
@@ -526,7 +527,7 @@ export class PiRuntime {
     if (options.resume) {
       harness.resume();
       await recorder.record("resume_called", {});
-      runtime.#ensureDriving();
+      void runtime.#ensureDriving().catch(() => undefined);
     }
     return runtime;
   }
@@ -553,11 +554,11 @@ export class PiRuntime {
         requestId,
         prompt: input.prompt,
       });
+      await this.#ensureDriving();
       submission = await this.root.submit(
         { type: "input", content: input.prompt, requestId },
         context,
       );
-      this.#ensureDriving();
     } finally {
       this.#release();
     }
@@ -574,11 +575,11 @@ export class PiRuntime {
     this.#holds++;
     try {
       for (const wake of [...this.#parked.values()]) wake();
+      await this.#ensureDriving();
       submission = await this.harness.submission(
         park.submissionId as SubmissionId,
         context,
       );
-      this.#ensureDriving();
     } finally {
       this.#release();
     }
@@ -600,7 +601,7 @@ export class PiRuntime {
       if (this.#closing) return CLOSED;
       throw error;
     }
-    this.#ensureDriving();
+    await this.#ensureDriving();
     return "accepted";
   }
 
@@ -619,21 +620,33 @@ export class PiRuntime {
     this.#change = Promise.withResolvers<void>();
   }
 
-  #ensureDriving(): void {
-    if (this.#drive !== undefined || this.#closing) return;
-    this.#drive = this.#driveLoop().catch((error: unknown) => {
-      this.#drive = undefined;
-      if (this.#closing) return;
-      this.events
-        .record("harness_error", {
-          message: error instanceof Error ? error.message : String(error),
-        })
-        .catch(() => undefined);
-    });
+  #ensureDriving(): Promise<void> {
+    if (this.#closing) return Promise.resolve();
+    if (this.#drive === undefined) {
+      const armId = randomUUID();
+      const armed = this.#parks?.armRun(armId, Date.now()) ?? Promise.resolve();
+      const drive = { armed };
+      this.#drive = drive;
+      armed
+        .then(() => this.#driveLoop(drive, armId))
+        .catch((error: unknown) => {
+          if (this.#drive === drive) this.#drive = undefined;
+          if (this.#closing) return;
+          this.events
+            .record("harness_error", {
+              message: error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
+        });
+    }
+    return this.#drive.armed;
   }
 
-  /** Watches live work until it settles or every runnable task is a parked gate; then closes to hold nothing. */
-  async #driveLoop(): Promise<void> {
+  /**
+   * Watches live work until it settles or every runnable task is a parked gate; then closes to hold nothing.
+   * RUN stays armed until then, so a process that dies mid-run is resumed by the sweeper.
+   */
+  async #driveLoop(drive: object, armId: string): Promise<void> {
     let worked = false;
     for (;;) {
       const next = this.#change.promise;
@@ -641,6 +654,8 @@ export class PiRuntime {
       const state = liveness(inspection, new Set(this.#parked.keys()), this.#holds);
       if (state === "idle") {
         this.#drive = undefined;
+        await this.#parks?.disarmRun(armId);
+        await this.#reapOrphanedParks();
         if (worked) await this.events.record("run_settled", {});
         return;
       }
@@ -648,17 +663,33 @@ export class PiRuntime {
         this.#drive = undefined;
         this.#closing = "parked";
         this.#onClosing?.();
+        await this.#parks?.disarmRun(armId);
         await this.events.record("runtime_parked", {
           gates: this.#parked.size,
         });
         await this.#shutdown();
         return;
       }
+      if (this.#drive !== drive) return;
       worked = true;
       await Promise.race([
         next,
         new Promise((resolve) => setTimeout(resolve, 1_000)),
       ]);
+    }
+  }
+
+  /**
+   * With no live task, no gate can consume a PARK any more (its task was aborted), and its wake attributes would
+   * make the sweeper resume the session every minute. Pending ones are left: a new run may have just written them.
+   */
+  async #reapOrphanedParks(): Promise<void> {
+    if (this.#parks === undefined) return;
+    const now = Date.now();
+    for (const park of await this.#parks.open()) {
+      if (verdictOf(park, now) === "pending") continue;
+      await this.#parks.consume(park.id, now);
+      await this.events.record("park_orphaned", { tool: park.tool });
     }
   }
 

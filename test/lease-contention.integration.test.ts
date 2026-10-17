@@ -5,8 +5,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   DynamoDbStorage,
   ensureSessionTable,
-} from "../src/storage/dynamodb.js";
-import { FencedWriterError, LeaseContentionError } from "../src/storage/errors.js";
+} from "../dist/storage/dynamodb.js";
+import { FencedWriterError, LeaseContentionError } from "../dist/storage/errors.js";
 
 const context = BACKGROUND_CONTEXT;
 const tableName = process.env.DYNAMODB_TABLE ?? "pi-durable-agentcore-sessions";

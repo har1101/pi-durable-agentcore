@@ -317,6 +317,38 @@ export class ParkStore {
     }
   }
 
+  /**
+   * Due at once: the sweeper resumes the session as soon as its lease lapses, so a run whose process died
+   * continues with no caller. Unconditional, so the latest arm wins.
+   */
+  async armRun(armId: string, now: number): Promise<void> {
+    const { docs, tableName } = await sessionTable();
+    await docs.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: { pk: this.#pk, sk: RUN_SK, armId, armedAt: now, ...this.#wake(now) },
+      }),
+    );
+  }
+
+  /** Only the arm that is still current is removed; a newer arm by another drive stays. */
+  async disarmRun(armId: string): Promise<void> {
+    const { docs, tableName } = await sessionTable();
+    try {
+      await docs.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: { pk: this.#pk, sk: RUN_SK },
+          UpdateExpression: "REMOVE wakeShard, wakeAt, runtimeSessionId",
+          ConditionExpression: "armId = :armId",
+          ExpressionAttributeValues: { ":armId": armId },
+        }),
+      );
+    } catch (error) {
+      if (!isConditionFailed(error)) throw error;
+    }
+  }
+
   /** PARK items the gate has not consumed yet. */
   async open(): Promise<ParkRecord[]> {
     const { docs, tableName } = await sessionTable();

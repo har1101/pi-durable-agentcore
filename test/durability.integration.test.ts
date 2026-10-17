@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
+import {
+  CreateTableCommand,
+  DescribeTableCommand,
+  DynamoDBClient,
+} from "@aws-sdk/client-dynamodb";
 import { afterEach, describe, expect, it } from "vitest";
+import { dynamoDbClientConfig, ensureSessionTable } from "../dist/storage/dynamodb.js";
 import {
   count,
   events,
@@ -84,5 +90,31 @@ describe("tool idempotency keys", () => {
     }
     expect(new Set(keys).size).toBe(2);
     expect(second.output()).toContain(`"idempotencyKey":"${keys[1]}"`);
+  });
+});
+
+describe("session table on DynamoDB Local", () => {
+  it("adds WakeIndex to an existing table that lacks it", async () => {
+    const tableName = `legacy-${randomUUID()}`;
+    const client = new DynamoDBClient(dynamoDbClientConfig());
+    await client.send(
+      new CreateTableCommand({
+        TableName: tableName,
+        BillingMode: "PAY_PER_REQUEST",
+        AttributeDefinitions: [
+          { AttributeName: "pk", AttributeType: "S" },
+          { AttributeName: "sk", AttributeType: "S" },
+        ],
+        KeySchema: [
+          { AttributeName: "pk", KeyType: "HASH" },
+          { AttributeName: "sk", KeyType: "RANGE" },
+        ],
+      }),
+    );
+    await ensureSessionTable(tableName);
+    const { Table } = await client.send(new DescribeTableCommand({ TableName: tableName }));
+    expect(Table?.GlobalSecondaryIndexes?.map((index) => index.IndexName)).toEqual([
+      "WakeIndex",
+    ]);
   });
 });
