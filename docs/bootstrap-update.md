@@ -21,9 +21,21 @@ empty. Omitting it on an update that originally passed an ARN would flip
 `CreateGitHubOidcProvider` to true and try to create (or replace) the provider.
 Always pass `UsePreviousValue=true` for that parameter.
 
-## Exact UPDATE command
+## Exact UPDATE command (immutable GitHub OIDC `sub`)
 
-From the repository root, after this PR's template is on disk:
+Repo `actions/oidc/customization/sub` is `use_immutable_subject: true` with
+prefix `repo:har1101@174846912/pi-durable-agentcore@1422425297`. Jobs in
+`environment: agentcore-poc` therefore present
+
+`repo:har1101@174846912/pi-durable-agentcore@1422425297:environment:agentcore-poc`
+
+not the legacy `repo:har1101/pi-durable-agentcore:environment:agentcore-poc`.
+This update adds those immutable `sub` values and keeps the legacy entries.
+Do **not** replace the OIDC provider, IAM roles, ECR repository, or DynamoDB
+table. `GitHubOidcSubPrefix` is new; every other parameter must keep its
+previous value.
+
+From the repository root, after this template is on `main`:
 
 ```bash
 aws cloudformation update-stack \
@@ -33,24 +45,19 @@ aws cloudformation update-stack \
   --template-body file://infra/github-oidc-bootstrap.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameters \
-    ParameterKey=GitHubOwner,ParameterValue=har1101 \
-    ParameterKey=GitHubRepository,ParameterValue=pi-durable-agentcore \
-    ParameterKey=GitHubBranch,ParameterValue=main \
-    ParameterKey=GitHubEnvironment,ParameterValue=agentcore-poc \
-    ParameterKey=SessionTableName,ParameterValue=pi-durable-agentcore-sessions \
+    ParameterKey=GitHubOidcSubPrefix,ParameterValue=repo:har1101@174846912/pi-durable-agentcore@1422425297 \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
     ParameterKey=EcrRepositoryName,UsePreviousValue=true \
     ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
 ```
 
 Required inputs: AWS CLI profile `fukuchi`, region `ap-northeast-1`, the
 updated `infra/github-oidc-bootstrap.yaml`, and `CAPABILITY_NAMED_IAM`.
-No AWS access keys.
+No AWS access keys. Do not run this from the agent environment.
 
-After update, set GitHub environment `agentcore-poc` variable `DYNAMODB_TABLE`
-to the `SessionTableName` output (`pi-durable-agentcore-sessions`). Existing
-deploy-role and execution-role ARNs stay as above.
-
-The OIDC `sub` mismatch is fixed because the deploy workflow uses
-`environment: agentcore-poc` (token sub
-`repo:har1101/pi-durable-agentcore:environment:agentcore-poc`), which 918f7b8
-did not allow.
+Existing deploy-role and execution-role ARNs stay as above. After this stack
+update, re-run GitHub Actions `agentcore-poc` (workflow_dispatch or push).

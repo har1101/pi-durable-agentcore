@@ -28,6 +28,10 @@ Parameters:
     Type: String
     Default: pi-durable-agentcore-sessions
     Description: DynamoDB table for Pi Durable session checkpoints
+  GitHubOidcSubPrefix:
+    Type: String
+    Default: repo:har1101@174846912/pi-durable-agentcore@1422425297
+    Description: Immutable GitHub Actions OIDC sub prefix (repo:ownerId/repoId) when use_immutable_subject is true
 
 Conditions:
   CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
@@ -152,8 +156,10 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
                 token.actions.githubusercontent.com:sub:
-                  - !Sub repo:${GitHubOwner}/${GitHubRepository}:ref:refs/heads/${GitHubBranch}
+                  - !Sub ${GitHubOidcSubPrefix}:environment:${GitHubEnvironment}
+                  - !Sub ${GitHubOidcSubPrefix}:ref:refs/heads/${GitHubBranch}
                   - !Sub repo:${GitHubOwner}/${GitHubRepository}:environment:${GitHubEnvironment}
+                  - !Sub repo:${GitHubOwner}/${GitHubRepository}:ref:refs/heads/${GitHubBranch}
       Policies:
         - PolicyName: PushThisEcrRepository
           PolicyDocument:
