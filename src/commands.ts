@@ -8,6 +8,7 @@ export type Command =
       readonly action: "decide";
       readonly approvalId: string;
       readonly decision: "approve" | "reject";
+      readonly approverToken?: string;
     }
   /** Sent by the resumer; it can only advance what durable state already allows. */
   | { readonly action: "resume" };
@@ -40,19 +41,29 @@ export function parseCommand(body: Record<string, unknown>): Parsed<Command> {
     if (body.decision !== "approve" && body.decision !== "reject") {
       return { ok: false, message: 'decision must be exactly "approve" or "reject"' };
     }
-    return { ok: true, value: { action, approvalId: body.approvalId, decision: body.decision } };
+    if (body.approverToken !== undefined && typeof body.approverToken !== "string") {
+      return { ok: false, message: "approverToken must be a string" };
+    }
+    return {
+      ok: true,
+      value: {
+        action,
+        approvalId: body.approvalId,
+        decision: body.decision,
+        ...(typeof body.approverToken === "string" ? { approverToken: body.approverToken } : {}),
+      },
+    };
   }
   if (action === "resume") return { ok: true, value: { action } };
   return { ok: false, message: "action must be invoke, decide, or resume" };
 }
 
 /**
- * AgentCore forwards `X-Amzn-Bedrock-AgentCore-Runtime-Custom-*` headers that
- * the runtime allowlists. The runtime stores only the token's SHA-256, and an
- * unset digest refuses every decision.
+ * Approvers hold a token the requester never sees; it travels in the decide
+ * payload, which InvokeAgentRuntime passes through without runtime header
+ * configuration. The runtime stores only its SHA-256, and an unset digest
+ * refuses every decision.
  */
-export const APPROVER_TOKEN_HEADER = "x-amzn-bedrock-agentcore-runtime-custom-approver-token";
-
 export function approverAuthorized(
   token: string | undefined,
   expectedSha256: string | undefined = process.env.APPROVER_TOKEN_SHA256,

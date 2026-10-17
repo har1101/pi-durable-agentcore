@@ -229,3 +229,66 @@ aws cloudformation update-stack \
     ParameterKey=EcrRepositoryName,UsePreviousValue=true \
     ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
 ```
+
+## Exact UPDATE command (resumer)
+
+This update adds automatic resume. Run it only after the GitHub Actions deploy
+has created the runtime, because it needs the runtime ARN.
+
+It changes the stack in place:
+
+- `AgentRuntimeExecutionRole`: adds `dynamodb:DeleteItem` on the session table,
+  so a runtime can delete its wake item when the session goes idle.
+- New, only when `AgentRuntimeArn` is not empty: `ResumerRole`,
+  `ResumerFunction` (Node.js 22, arm64, inline code from
+  `infra/resumer/index.cjs`), `ResumerSchedule` (EventBridge rule), and
+  `ResumerSchedulePermission`.
+- New output `ResumerFunctionArn`.
+
+The DynamoDB table, OIDC provider, ECR repository, and both existing roles
+keep their logical IDs and replacement-sensitive properties. The table gets no
+new index or attribute definition: wake items use the existing `pk`/`sk` key.
+`test/infra.test.ts` checks these invariants.
+
+New parameters:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `AgentRuntimeArn` | `""` | runtime the resumer invokes; empty creates no resumer |
+| `ResumeSweepSchedule` | `rate(1 minute)` | how often the resumer looks for due sessions |
+| `ResumeClaimSeconds` | `300` | how long one claim blocks other sweeps (retry backoff) |
+
+Find the runtime ARN with
+`aws bedrock-agentcore-control list-agent-runtimes --profile fukuchi --region ap-northeast-1`
+(the GitHub Actions log also prints `AGENT_RUNTIME_ARN=`). Every other
+parameter keeps its previous value.
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=AgentRuntimeArn,ParameterValue=arn:aws:bedrock-agentcore:ap-northeast-1:064212132988:runtime/<runtime-id> \
+    ParameterKey=ResumeSweepSchedule,ParameterValue="rate(1 minute)" \
+    ParameterKey=ResumeClaimSeconds,ParameterValue=300 \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
+```
+
+To check the change before applying it, run `create-change-set` with the same
+arguments and `--change-set-name resumer`, then confirm that
+`describe-change-set` lists `Replacement: False` for every `Modify` row.
+
+To approve actions in the deployed runtime, set the GitHub variable
+`APPROVER_TOKEN_SHA256` to the hex SHA-256 of a token only approvers hold
+(`printf %s "$TOKEN" | sha256sum`) and redeploy. Approvers send the token as
+`approverToken` in the `decide` payload.

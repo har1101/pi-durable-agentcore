@@ -145,8 +145,7 @@ describe("automatic resume without a client request", () => {
       expect(await wakeItem(sessionId)).toBeUndefined();
 
       const late = await replacement.invoke(
-        { action: "decide", approvalId: pending.body.approvalId, decision: "approve" },
-        { "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Approver-Token": token },
+        { action: "decide", approvalId: pending.body.approvalId, decision: "approve", approverToken: token },
       );
       expect(late.status).toBe(409);
       expect(late.body).toMatchObject({

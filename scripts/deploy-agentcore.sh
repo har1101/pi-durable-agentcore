@@ -13,7 +13,16 @@ image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITOR
 artifact="{\"containerConfiguration\":{\"containerUri\":\"${image_uri}\"}}"
 table_name="${DYNAMODB_TABLE:-pi-durable-agentcore-sessions}"
 delay_ms="${SCRIPTED_TOOL_DELAY_MS:-20000}"
-environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\",\"SCRIPTED_TOOL_DELAY_MS\":\"${delay_ms}\"}"
+approver_digest="${APPROVER_TOKEN_SHA256:-}"
+if [[ -n "$approver_digest" && ! "$approver_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "APPROVER_TOKEN_SHA256 must be 64 lowercase hex characters" >&2
+  exit 1
+fi
+approver_env=""
+if [[ -n "$approver_digest" ]]; then
+  approver_env=",\"APPROVER_TOKEN_SHA256\":\"${approver_digest}\""
+fi
+environment="{\"MODEL_PROVIDER\":\"bedrock\",\"BEDROCK_MODEL_ID\":\"${model_id}\",\"STATE_DIRECTORY\":\"/tmp/pi-durable-agentcore\",\"STORAGE_BACKEND\":\"dynamodb\",\"DYNAMODB_TABLE\":\"${table_name}\",\"AWS_REGION\":\"${AWS_REGION}\",\"PI_SESSION_LEASE_TTL_MS\":\"${PI_SESSION_LEASE_TTL_MS:-15000}\",\"SCRIPTED_TOOL_DELAY_MS\":\"${delay_ms}\",\"PI_WAKE_GRACE_MS\":\"${PI_WAKE_GRACE_MS:-60000}\",\"APPROVAL_TIMEOUT_MS\":\"${APPROVAL_TIMEOUT_MS:-86400000}\"${approver_env}}"
 
 runtime_id="${AGENT_RUNTIME_ID:-}"
 if [[ -z "$runtime_id" ]]; then

@@ -58,6 +58,7 @@ jobs:
           AGENT_RUNTIME_NAME: ${{ vars.AGENT_RUNTIME_NAME }}
           BEDROCK_MODEL_ID: ${{ vars.BEDROCK_MODEL_ID }}
           DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE }}
+          APPROVER_TOKEN_SHA256: ${{ vars.APPROVER_TOKEN_SHA256 }}
           IMAGE_TAG: ${{ github.sha }}
         run: bash scripts/deploy-agentcore.sh
 

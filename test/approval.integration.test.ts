@@ -11,9 +11,7 @@ const approverToken = `approver-${randomUUID()}`;
 const approverEnv = {
   APPROVER_TOKEN_SHA256: createHash("sha256").update(approverToken).digest("hex"),
 };
-const asApprover = {
-  "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Approver-Token": approverToken,
-};
+const asApprover = { approverToken };
 
 async function effectCount(idempotencyKey: string): Promise<number> {
   const docs = createDynamoDbDocumentClient({ endpoint: process.env.DYNAMODB_ENDPOINT });
@@ -57,22 +55,20 @@ describe("human approval that leaves the process", () => {
 
     const second = await startServer(sessionId, approverEnv);
     try {
-      const decide = (decision: unknown, headers: Record<string, string> = asApprover) =>
-        second.invoke({ action: "decide", approvalId, decision }, headers);
+      const decide = (decision: unknown, credentials: Record<string, unknown> = asApprover) =>
+        second.invoke({ action: "decide", approvalId, decision, ...credentials });
 
       expect((await decide("approve", {})).status).toBe(403);
       expect(
         (
-          await decide("approve", {
-            "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Approver-Token": approvalId,
-          })
+          await decide("approve", { approverToken: approvalId })
         ).status,
       ).toBe(403);
       for (const ambiguous of ["yes", "APPROVE", "approved", true, 1, null]) {
         expect((await decide(ambiguous)).status).toBe(400);
       }
       expect(
-        (await second.invoke({ action: "decide", approvalId: "apr_" + "0".repeat(32), decision: "approve" }, asApprover))
+        (await second.invoke({ action: "decide", approvalId: "apr_" + "0".repeat(32), decision: "approve", ...asApprover }))
           .status,
       ).toBe(404);
       expect(await effectCount(key)).toBe(0);
@@ -124,8 +120,7 @@ describe("human approval that leaves the process", () => {
       const pending = await server.invoke({ prompt: "[approval] drop the table", requestId: "reject-1" });
       expect(pending.body.status).toBe("pending");
       const rejected = await server.invoke(
-        { action: "decide", approvalId: pending.body.approvalId, decision: "reject" },
-        asApprover,
+        { action: "decide", approvalId: pending.body.approvalId, decision: "reject", ...asApprover },
       );
       expect(rejected.body).toMatchObject({
         outcome: "decided",
@@ -147,8 +142,7 @@ describe("human approval that leaves the process", () => {
     try {
       const pending = await server.invoke({ prompt: "[approval] deploy", requestId: "noauth-1" });
       const attempt = await server.invoke(
-        { action: "decide", approvalId: pending.body.approvalId, decision: "approve" },
-        asApprover,
+        { action: "decide", approvalId: pending.body.approvalId, decision: "approve", ...asApprover },
       );
       expect(attempt.status).toBe(403);
     } finally {

@@ -52,7 +52,7 @@ async function handler() {
   const results = await sweep({
     dynamodb: new DynamoDBClient({}),
     tableName: process.env.TABLE_NAME,
-    claimMs: Number(process.env.CLAIM_MS || 300000),
+    claimMs: Number(process.env.CLAIM_SECONDS || 300) * 1000,
     invoke: async (runtimeSessionId, payload) => {
       const out = await agentcore.send(new InvokeAgentRuntimeCommand({
         agentRuntimeArn: process.env.AGENT_RUNTIME_ARN,

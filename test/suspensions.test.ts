@@ -75,6 +75,7 @@ describe("decide command boundary", () => {
       expect(parseCommand({ action: "decide", approvalId, decision }).ok).toBe(false);
     }
     expect(parseCommand({ action: "decide", approvalId: "apr_x", decision: "approve" }).ok).toBe(false);
+    expect(parseCommand({ action: "decide", approvalId, decision: "approve", approverToken: 1 }).ok).toBe(false);
   });
 
   it("authorizes only the configured approver token", () => {

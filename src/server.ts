@@ -6,7 +6,6 @@ import {
 import { URL } from "node:url";
 import { SessionFailed } from "@earendil-works/pi-durable";
 import {
-  APPROVER_TOKEN_HEADER,
   approverAuthorized,
   parseCommand,
 } from "./commands.js";
@@ -136,8 +135,7 @@ const server = createServer(async (request, response) => {
         json(response, 200, await runtime.resume());
         return;
       }
-      const token = request.headers[APPROVER_TOKEN_HEADER];
-      if (!approverAuthorized(Array.isArray(token) ? token[0] : token)) {
+      if (!approverAuthorized(command.approverToken)) {
         response.setHeader("x-amzn-ErrorType", "AccessDeniedException");
         json(response, 403, { message: "approver token missing or invalid" });
         return;
