@@ -104,6 +104,36 @@ Fukuchi applied this update: stack is **UPDATE_COMPLETE**. Re-run GitHub
 Actions `agentcore-poc` (push to main; workflow_dispatch is 403 for this
 token).
 
+## Exact UPDATE command (CreateAgentRuntimeEndpoint + related)
+
+GHA run 39000719319 pushed the ARM64 image, then CreateAgentRuntime failed:
+
+`not authorized to perform bedrock-agentcore:CreateAgentRuntimeEndpoint`
+on `arn:aws:bedrock-agentcore:ap-northeast-1:064212132988:runtime/*`.
+
+One in-place policy add covers the rest of this deploy+invoke path so we
+do not dribble: Create/Get/List/UpdateAgentRuntimeEndpoint, TagResource,
+ListTagsForResource, InvokeAgentRuntimeForUser. Do **not** replace OIDC,
+roles, ECR, or DynamoDB. Every parameter keeps its previous value.
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
+```
+
 ```bash
 aws cloudformation update-stack \
   --profile fukuchi \

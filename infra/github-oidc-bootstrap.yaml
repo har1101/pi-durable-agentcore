@@ -193,6 +193,22 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestTag/Project: pi-durable-agentcore
+              - Sid: ManageRuntimeEndpoints
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-endpoint/*
+              - Sid: TagThisRuntime
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:TagResource
+                  - bedrock-agentcore:ListTagsForResource
+                Resource: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
               - Sid: UpdateTaggedRuntime
                 Effect: Allow
                 Action:
@@ -217,6 +233,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - bedrock-agentcore:InvokeAgentRuntime
+                  - bedrock-agentcore:InvokeAgentRuntimeForUser
                   - bedrock-agentcore:StopRuntimeSession
                 Resource:
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
