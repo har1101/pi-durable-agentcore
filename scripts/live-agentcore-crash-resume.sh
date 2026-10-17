@@ -46,6 +46,32 @@ echo "RUNTIME_SESSION_ID=${session_id}" | tee -a "$log_dir/runtime-ids.txt"
 echo "REQUEST_ID=${request_id}" | tee -a "$log_dir/runtime-ids.txt"
 printf '%s\n' "$payload" >"$log_dir/payload.json"
 
+set +e
+aws bedrock-agentcore-control get-agent-runtime \
+  --region "$AWS_REGION" \
+  --agent-runtime-id "$runtime_id" \
+  --output json >"$log_dir/get-agent-runtime.json" 2>"$log_dir/get-agent-runtime.err"
+set -e
+python3 - <<PY
+import json
+from pathlib import Path
+log_dir = Path("$log_dir")
+err = (log_dir / "get-agent-runtime.err").read_text().strip()
+if err:
+    print("get-agent-runtime.err=" + err)
+try:
+    data = json.loads((log_dir / "get-agent-runtime.json").read_text() or "{}")
+except Exception as exc:
+    print(f"get-agent-runtime parse error: {exc}")
+    raise SystemExit(0)
+runtime = data.get("agentRuntime") or data
+artifact = runtime.get("agentRuntimeArtifact") or data.get("agentRuntimeArtifact") or {}
+container = (artifact.get("containerConfiguration") or artifact.get("container") or {})
+uri = container.get("containerUri") or artifact
+print(f"RUNTIME_IMAGE={uri}")
+(log_dir / "runtime-ids.txt").open("a").write(f"RUNTIME_IMAGE={uri}\n")
+PY
+
 echo "Waiting for DEFAULT endpoint READY before invoke..." | tee -a "$log_dir/summary.log"
 ready=""
 for _ in $(seq 1 40); do
@@ -98,20 +124,36 @@ dump_cloudwatch() {
     --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/${runtime_id}" \
     --output json >"$log_dir/cw-log-groups.json" 2>"$log_dir/cw-describe.err"
   python3 - <<PY
-import json, subprocess, os
+import json, subprocess, os, sys
 from pathlib import Path
 region = os.environ["AWS_REGION"]
 log_dir = Path("$log_dir")
 rid = "$runtime_id"
+
+def dump_err(name):
+    path = log_dir / name
+    text = path.read_text() if path.exists() else ""
+    if text.strip():
+        print(f"{name}: {text.strip()[:2000]}")
+
 data = {}
 try:
     data = json.loads((log_dir / "cw-log-groups.json").read_text() or "{}")
 except Exception as exc:
     (log_dir / "cw-parse.err").write_text(str(exc))
+    print(f"cw-parse.err={exc}")
+dump_err("cw-describe.err")
 groups = [g.get("logGroupName","") for g in data.get("logGroups", [])]
 matched = [g for g in groups if rid in g] or groups
 (log_dir / "cw-matched-groups.txt").write_text("\n".join(matched) + ("\n" if matched else ""))
 print("cw_groups=" + ",".join(matched) if matched else "cw_groups=(none)")
+if not matched:
+    print("FAIL no CloudWatch log groups matched; DescribeLogGroups errors above")
+interesting = (
+    "BEDROCK_PROVIDER", "TOOL_ATTEMPT", "RuntimeClientError",
+    "Provider is not configured", "idempotent", "Session failed",
+    "runtime_opened", "resume_called",
+)
 for i, name in enumerate(matched[:3]):
     streams_out = log_dir / f"cw-streams-{i}.json"
     subprocess.run(
@@ -121,13 +163,15 @@ for i, name in enumerate(matched[:3]):
         stdout=streams_out.open("w"), stderr=(log_dir / "cw-streams.err").open("a"),
         check=False,
     )
+    dump_err("cw-streams.err")
     try:
         streams = json.loads(streams_out.read_text() or "{}").get("logStreams", [])
-    except Exception:
+    except Exception as exc:
         streams = []
-    (log_dir / f"cw-stream-names-{i}.txt").write_text(
-        "\n".join(s.get("logStreamName","") for s in streams) + "\n"
-    )
+        print(f"cw-streams parse error: {exc}")
+    names = [s.get("logStreamName","") for s in streams]
+    (log_dir / f"cw-stream-names-{i}.txt").write_text("\n".join(names) + "\n")
+    print(f"cw_streams_{i}=" + ",".join(names) if names else f"cw_streams_{i}=(none)")
     subprocess.run(
         ["aws", "logs", "filter-log-events", "--region", region,
          "--log-group-name", name, "--limit", "200", "--output", "json"],
@@ -135,6 +179,7 @@ for i, name in enumerate(matched[:3]):
         stderr=(log_dir / "cw-filter.err").open("a"),
         check=False,
     )
+    dump_err("cw-filter.err")
     for j, stream in enumerate(streams[:5]):
         sn = stream.get("logStreamName")
         if not sn:
@@ -147,6 +192,21 @@ for i, name in enumerate(matched[:3]):
             stderr=(log_dir / "cw-get.err").open("a"),
             check=False,
         )
+    dump_err("cw-get.err")
+    printed = 0
+    for path in sorted(log_dir.glob("cw-*.json")):
+        try:
+            events = json.loads(path.read_text() or "{}").get("events") or []
+        except Exception:
+            continue
+        for event in events:
+            msg = (event.get("message") or "").replace("\n", " | ")
+            if any(key in msg for key in interesting):
+                print(f"cw_event {path.name}: {msg[:500]}")
+                printed += 1
+    print(f"cw_interesting_events={printed}")
+    if printed == 0:
+        print("cw_events=(none visible in dumped files)")
 PY
   set -e
 }

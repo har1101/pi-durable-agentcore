@@ -4,6 +4,7 @@ import {
   CreateTableCommand,
   DescribeTableCommand,
   DynamoDBClient,
+  IdempotentParameterMismatchException,
   ResourceInUseException,
   ResourceNotFoundException,
   TransactionCanceledException,
@@ -16,6 +17,7 @@ import {
   QueryCommand,
   TransactWriteCommand,
   UpdateCommand,
+  type TransactWriteCommandInput,
 } from "@aws-sdk/lib-dynamodb";
 import type { Context } from "@earendil-works/chord";
 import {
@@ -220,6 +222,25 @@ function isConditionalCheckFailed(error: unknown): boolean {
   );
 }
 
+function isIdempotentParameterMismatch(error: unknown): boolean {
+  return (
+    error instanceof IdempotentParameterMismatchException ||
+    (error as { name?: string }).name === "IdempotentParameterMismatchException"
+  );
+}
+
+/**
+ * DynamoDB TransactWriteItems ClientRequestToken is max 36 chars and is
+ * remembered for ~10 minutes. AgentCore replacement microVMs can replay an
+ * SDK auto-token (cloned RNG) with a different payload — unique tokens here.
+ */
+function transactClientRequestToken(parts: readonly unknown[]): string {
+  return createHash("sha256")
+    .update(parts.map((part) => String(part)).join("\0"))
+    .digest("hex")
+    .slice(0, 36);
+}
+
 /**
  * Pi Durable `Storage` over DynamoDB. Commits are an append-only log replayed
  * into MemoryStorage. Ownership is a conditional-write lease plus a monotonic
@@ -300,54 +321,54 @@ export class DynamoDbStorage implements Storage {
         );
       }
       try {
-        await this.docs.send(
-          new TransactWriteCommand({
-            TransactItems: [
-              this.leaseCondition(),
-              {
-                Put: {
-                  TableName: this.tableName,
-                  Item: {
-                    pk: this.pk,
-                    sk: commitSk(prepared.seq),
-                    kind: "commit",
-                    seq: prepared.seq,
-                    fencingToken: this.fencingToken,
-                    chunkCount: chunks.length,
-                    payloadHash: hash,
-                    ...(chunks.length === 1 ? { payload: chunks[0] } : {}),
-                  },
-                  ConditionExpression: "attribute_not_exists(sk)",
+        await this.transactWrite(
+          [
+            this.leaseCondition(),
+            {
+              Put: {
+                TableName: this.tableName,
+                Item: {
+                  pk: this.pk,
+                  sk: commitSk(prepared.seq),
+                  kind: "commit",
+                  seq: prepared.seq,
+                  fencingToken: this.fencingToken,
+                  chunkCount: chunks.length,
+                  payloadHash: hash,
+                  ...(chunks.length === 1 ? { payload: chunks[0] } : {}),
                 },
+                ConditionExpression: "attribute_not_exists(sk)",
               },
-              ...(chunks.length === 1
-                ? []
-                : chunks.map((payload, index) => ({
-                    Put: {
-                      TableName: this.tableName,
-                      Item: {
-                        pk: this.pk,
-                        sk: commitSk(prepared.seq, index),
-                        kind: "chunk",
-                        seq: prepared.seq,
-                        payload,
-                      },
-                      ConditionExpression: "attribute_not_exists(sk)",
+            },
+            ...(chunks.length === 1
+              ? []
+              : chunks.map((payload, index) => ({
+                  Put: {
+                    TableName: this.tableName,
+                    Item: {
+                      pk: this.pk,
+                      sk: commitSk(prepared.seq, index),
+                      kind: "chunk",
+                      seq: prepared.seq,
+                      payload,
                     },
-                  }))),
-              {
-                Update: {
-                  TableName: this.tableName,
-                  Key: { pk: this.pk, sk: META_SK },
-                  UpdateExpression: "SET nextSeq = :nextSeq, nextId = :nextId",
-                  ExpressionAttributeValues: {
-                    ":nextSeq": prepared.seq + 1,
-                    ":nextId": persistedNextId,
+                    ConditionExpression: "attribute_not_exists(sk)",
                   },
+                }))),
+            {
+              Update: {
+                TableName: this.tableName,
+                Key: { pk: this.pk, sk: META_SK },
+                UpdateExpression: "SET nextSeq = :nextSeq, nextId = :nextId",
+                ExpressionAttributeValues: {
+                  ":nextSeq": prepared.seq + 1,
+                  ":nextId": persistedNextId,
                 },
               },
-            ],
-          }),
+            },
+          ],
+          "commit",
+          `${prepared.seq}:${hash}`,
         );
       } catch (error) {
         if (error instanceof TransactionCanceledException) {
@@ -376,22 +397,22 @@ export class DynamoDbStorage implements Storage {
       }
       const id = this.nextId;
       try {
-        await this.docs.send(
-          new TransactWriteCommand({
-            TransactItems: [
-              this.leaseCondition(),
-              {
-                Update: {
-                  TableName: this.tableName,
-                  Key: { pk: this.pk, sk: META_SK },
-                  UpdateExpression: "SET nextId = :next",
-                  ExpressionAttributeValues: {
-                    ":next": id + 1,
-                  },
+        await this.transactWrite(
+          [
+            this.leaseCondition(),
+            {
+              Update: {
+                TableName: this.tableName,
+                Key: { pk: this.pk, sk: META_SK },
+                UpdateExpression: "SET nextId = :next",
+                ExpressionAttributeValues: {
+                  ":next": id + 1,
                 },
               },
-            ],
-          }),
+            },
+          ],
+          "mint",
+          String(id),
         );
       } catch (error) {
         if (error instanceof TransactionCanceledException) {
@@ -544,6 +565,39 @@ export class DynamoDbStorage implements Storage {
     await this.memory.close(context);
   }
 
+  private async transactWrite(
+    items: NonNullable<TransactWriteCommandInput["TransactItems"]>,
+    purpose: string,
+    extra: string,
+  ): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.docs.send(
+          new TransactWriteCommand({
+            TransactItems: items,
+            ClientRequestToken: transactClientRequestToken([
+              this.pk,
+              this.ownerId,
+              this.fencingToken,
+              purpose,
+              extra,
+              attempt,
+              Date.now(),
+              process.hrtime.bigint(),
+              randomUUID(),
+            ]),
+          }),
+        );
+        return;
+      } catch (error) {
+        lastError = error;
+        if (!isIdempotentParameterMismatch(error)) throw error;
+      }
+    }
+    throw lastError;
+  }
+
   private leaseCondition() {
     return {
       ConditionCheck: {
@@ -672,25 +726,25 @@ export class DynamoDbStorage implements Storage {
         : INITIAL_NEXT_SEQ;
     if (result.Item === undefined) {
       try {
-        await this.docs.send(
-          new TransactWriteCommand({
-            TransactItems: [
-              this.leaseCondition(),
-              {
-                Put: {
-                  TableName: this.tableName,
-                  Item: {
-                    pk: this.pk,
-                    sk: META_SK,
-                    kind: "meta",
-                    nextId: INITIAL_NEXT_ID,
-                    nextSeq: INITIAL_NEXT_SEQ,
-                  },
-                  ConditionExpression: "attribute_not_exists(sk)",
+        await this.transactWrite(
+          [
+            this.leaseCondition(),
+            {
+              Put: {
+                TableName: this.tableName,
+                Item: {
+                  pk: this.pk,
+                  sk: META_SK,
+                  kind: "meta",
+                  nextId: INITIAL_NEXT_ID,
+                  nextSeq: INITIAL_NEXT_SEQ,
                 },
+                ConditionExpression: "attribute_not_exists(sk)",
               },
-            ],
-          }),
+            },
+          ],
+          "meta",
+          "init",
         );
       } catch (error) {
         if (

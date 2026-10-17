@@ -4,6 +4,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { URL } from "node:url";
+import { SessionFailed } from "@earendil-works/pi-durable";
 import { PiRuntime, type ModelMode } from "./runtime.js";
 
 const host = process.env.HOST ?? "0.0.0.0";
@@ -36,6 +37,27 @@ async function runtimeFor(id: string): Promise<PiRuntime> {
     pending.catch(() => runtimes.delete(id));
   }
   return pending;
+}
+
+function forgetRuntime(id: string): void {
+  const pending = runtimes.get(id);
+  if (!pending) return;
+  runtimes.delete(id);
+  void pending
+    .then((runtime) => runtime.close())
+    .catch(() => undefined);
+}
+
+function isFailedSessionError(error: unknown): boolean {
+  if (error instanceof SessionFailed) return true;
+  const name = (error as { name?: string }).name;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    name === "SessionFailed" ||
+    name === "IdempotentParameterMismatchException" ||
+    message.includes("Session failed after a storage error") ||
+    message.includes("idempotent token")
+  );
 }
 
 function json(response: ServerResponse, status: number, body: unknown): void {
@@ -133,6 +155,9 @@ const server = createServer(async (request, response) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const stack = error instanceof Error ? error.stack : undefined;
+    if (isFailedSessionError(error)) {
+      forgetRuntime(sessionId(request, url));
+    }
     process.stderr.write(
       `RuntimeClientError ${request.method} ${url.pathname}: ${message}\n${stack ?? ""}\n`,
     );
