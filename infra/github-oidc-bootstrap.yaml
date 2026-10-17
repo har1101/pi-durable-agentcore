@@ -216,16 +216,21 @@ Resources:
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-endpoint/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-version/*
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/*/workload-identity/*
+              - Sid: ListWorkloadIdentities
+                Effect: Allow
+                Action: bedrock-agentcore:ListWorkloadIdentities
+                Resource: "*"
               - Sid: ManageWorkloadIdentity
                 Effect: Allow
                 Action:
                   - bedrock-agentcore:CreateWorkloadIdentity
                   - bedrock-agentcore:GetWorkloadIdentity
-                  - bedrock-agentcore:ListWorkloadIdentities
                   - bedrock-agentcore:UpdateWorkloadIdentity
                 Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/*
                   - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/*/workload-identity/*
               - Sid: UpdateTaggedRuntime

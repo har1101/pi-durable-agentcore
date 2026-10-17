@@ -127,8 +127,10 @@ GHA run 39001137344 pushed the image, then CreateAgentRuntime failed:
 `bedrock-agentcore:TagResource` on
 `arn:aws:bedrock-agentcore:ap-northeast-1:064212132988:workload-identity-directory/default/workload-identity/pi_durable_agentcore-UcUt2555jm`
 
-One in-place add: TagResource/ListTagsForResource on workload-identity ARNs,
-plus Create/Get/List/UpdateWorkloadIdentity. Do **not** replace OIDC, roles,
+One in-place add: TagResource/ListTagsForResource on runtime, endpoint,
+version, `workload-identity/*`, and
+`workload-identity-directory/*/workload-identity/*`, plus
+Create/Get/List/UpdateWorkloadIdentity. Do **not** replace OIDC, roles,
 ECR, or DynamoDB. Every parameter keeps its previous value.
 
 ```bash
