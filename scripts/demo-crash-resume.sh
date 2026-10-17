@@ -47,14 +47,16 @@ events="$(node "$repo_root/dist/demo-worker.js" events \
   --state-dir "$state_dir" \
   --session-id "$session_id")"
 attempts="$(grep -c '"kind":"tool_attempt"' <<<"$events" || true)"
+keys="$(grep -o '"idempotencyKey":"tk1_[0-9a-f]*"' <<<"$events" | sort -u | wc -l)"
 grep -q "resume_called" "$resume_log"
 grep -q "DEMO_RESULT" "$resume_log"
 grep -q '"storage":"dynamodb"' "$resume_log"
 test "$attempts" -eq 2
+test "$keys" -eq 1
 
 cat "$first_log"
 cat "$resume_log"
-echo "PASS crash->resume: attempts=$attempts, state=$state_dir, session=$session_id"
+echo "PASS crash->resume: attempts=$attempts, idempotency_keys=$keys, state=$state_dir, session=$session_id"
 
 if [[ -n "$evidence_dir" ]]; then
   mkdir -p "$evidence_dir"

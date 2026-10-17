@@ -54,3 +54,35 @@ describe("durable event log", () => {
     );
   });
 });
+
+describe("tool idempotency keys", () => {
+  it("gives each tool use its own key even when the provider reuses call id durable-wait-1 across processes", async () => {
+    const s = scenario();
+    const sessionId = `keys-${randomUUID()}`;
+    const first = await s.server();
+    expect(
+      (await post(first, sessionId, { prompt: "One.", requestId: "r1" })).body,
+    ).toMatchObject({ status: "success" });
+    await first.kill("SIGTERM");
+    const second = await s.server();
+    expect(
+      (await post(second, sessionId, { prompt: "Two.", requestId: "r2" })).body,
+    ).toMatchObject({ status: "success" });
+
+    const attempts = (await events(second, sessionId)).filter(
+      (event) => event.kind === "tool_attempt",
+    );
+    expect(attempts.map((event) => event.pid)).toEqual([first.pid, second.pid]);
+    expect(attempts.map((event) => event.detail?.callId)).toEqual([
+      "durable-wait-1",
+      "durable-wait-1",
+    ]);
+    const keys = attempts.map((event) => String(event.detail?.idempotencyKey));
+    for (const key of keys) {
+      expect(key).toMatch(/^tk1_[0-9a-f]{64}$/);
+      expect(key).not.toContain(sessionId);
+    }
+    expect(new Set(keys).size).toBe(2);
+    expect(second.output()).toContain(`"idempotencyKey":"${keys[1]}"`);
+  });
+});

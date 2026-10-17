@@ -1,11 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   Type,
   type AssistantMessage,
+  type Static,
   type TranscriptContext,
+  type TSchema,
 } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -25,12 +28,16 @@ import {
   type AgentEventStream,
   type Conversation,
   type SettledSubmissionRecord,
+  type ToolExecutionApi,
+  type ToolExecutionResult,
+  type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import {
   applyBedrockRuntimeEnv,
   createConfiguredAmazonBedrockProvider,
 } from "./bedrock-provider.js";
 import { openEventLog, type EventLog } from "./event-recorder.js";
+import { toolKey, type IdempotencyKey } from "./parks.js";
 import { openSessionStorage } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -80,11 +87,12 @@ function hasToolResultAfterLastUser(transcript: TranscriptContext): boolean {
     );
 }
 
-function scriptedResponse(
+async function scriptedResponse(
+  events: EventLog,
   transcript: TranscriptContext,
-  _options: unknown,
   state: FauxProviderState,
-): AssistantMessage {
+): Promise<AssistantMessage> {
+  await events.record("model_call", { call: state.callCount });
   if (process.env.SCRIPTED_MODEL_ERROR === "1") {
     return fauxAssistantMessage([], {
       stopReason: "error",
@@ -108,6 +116,46 @@ function scriptedResponse(
     ],
     { stopReason: "toolUse" },
   );
+}
+
+type KeyedTool<P extends TSchema> = Omit<ToolRegistration<P>, "execute"> & {
+  run(
+    args: Static<P>,
+    key: IdempotencyKey,
+    api: ToolExecutionApi,
+    context: Context,
+  ): Promise<ToolExecutionResult>;
+};
+
+/**
+ * Every registered tool is built here, so none runs without its idempotency key and a durable
+ * `tool_attempt` record written before its body starts.
+ */
+function keyed<P extends TSchema>(
+  sessionId: string,
+  events: EventLog,
+  { run, ...tool }: KeyedTool<P>,
+): ToolRegistration<P> {
+  return defineTool<P>({
+    ...tool,
+    execute: async (args, api, context) => {
+      const key = toolKey(sessionId, api.taskId);
+      const attempt = {
+        timestamp: new Date().toISOString(),
+        pid: process.pid,
+        tool: tool.name,
+        sessionId,
+        idempotencyKey: key,
+      };
+      process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
+      await events.record("tool_attempt", {
+        tool: tool.name,
+        idempotencyKey: key,
+        callId: api.callId,
+      });
+      return run(args, key, api, context);
+    },
+  });
 }
 
 function unansweredPayload(settled: SettledSubmissionRecord): {
@@ -209,31 +257,26 @@ export class PiRuntime {
       );
     } else {
       const faux = fauxProvider({ tokensPerSecond: 10_000 });
-      faux.setResponses(Array.from({ length: 100 }, () => scriptedResponse));
+      faux.setResponses(
+        Array.from(
+          { length: 100 },
+          () => (transcript: TranscriptContext, _: unknown, state: FauxProviderState) =>
+            scriptedResponse(recorder, transcript, state),
+        ),
+      );
       models.setProvider(faux.provider);
     }
 
     const delayMs =
       options.scriptedDelayMs ??
       Number(process.env.SCRIPTED_TOOL_DELAY_MS ?? 5_000);
-    const waitTool = defineTool({
+    const waitTool = keyed(options.sessionId, recorder, {
       name: "durable_wait",
       description:
         "Wait briefly so process-crash recovery can be demonstrated.",
       parameters: Type.Object({ label: Type.String() }),
       replay: "safe",
-      execute: async ({ label }, api) => {
-        const attempt = {
-          timestamp: new Date().toISOString(),
-          pid: process.pid,
-          label,
-          sessionId: options.sessionId,
-        };
-        process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
-        await recorder.record("tool_attempt", {
-          tool: "durable_wait",
-          callId: api.callId,
-        });
+      run: async ({ label }) => {
         await recorder.record("tool_call_started", {
           name: "durable_wait",
           label,
