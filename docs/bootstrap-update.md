@@ -90,3 +90,30 @@ aws cloudformation update-stack \
     ParameterKey=EcrRepositoryName,UsePreviousValue=true \
     ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
 ```
+
+## Exact UPDATE command (ECR BatchGetImage on GitHubDeployRole)
+
+GHA run 39000278083 built the ARM64 image then failed pushing the
+manifest/attestations: `ecr:BatchGetImage` is not on `GitHubDeployRole`.
+`ecr:BatchCheckLayerAvailability` was already present. This update adds
+`ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer`. In-place policy add
+only; do **not** replace the OIDC provider, roles, ECR, or DynamoDB table.
+Every parameter keeps its previous value. Do not run AWS from this agent.
+
+```bash
+aws cloudformation update-stack \
+  --profile fukuchi \
+  --region ap-northeast-1 \
+  --stack-name pi-durable-agentcore-bootstrap \
+  --template-body file://infra/github-oidc-bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=GitHubOidcSubPrefix,UsePreviousValue=true \
+    ParameterKey=GitHubOwner,UsePreviousValue=true \
+    ParameterKey=GitHubRepository,UsePreviousValue=true \
+    ParameterKey=GitHubBranch,UsePreviousValue=true \
+    ParameterKey=GitHubEnvironment,UsePreviousValue=true \
+    ParameterKey=SessionTableName,UsePreviousValue=true \
+    ParameterKey=EcrRepositoryName,UsePreviousValue=true \
+    ParameterKey=ExistingGitHubOidcProviderArn,UsePreviousValue=true
+```

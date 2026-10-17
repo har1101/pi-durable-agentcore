@@ -45,6 +45,8 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
+          provenance: false
+          sbom: false
           tags: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
 
       - name: Create or update AgentCore Runtime
