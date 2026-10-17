@@ -51,6 +51,21 @@ describe("real process integration against DynamoDB Local", () => {
     expect(resumedLog).toContain(
       "Finished after the durable tool checkpoint was committed.",
     );
+
+    const listed = await execFileAsync(
+      process.execPath,
+      ["dist/demo-worker.js", "events", "--state-dir", state, "--session-id", sessionId],
+      { cwd: process.cwd(), env: process.env, maxBuffer: 5_000_000 },
+    );
+    const events = listed.stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { kind: string; pid: number; detail: any });
+    const attempts = events.filter((event) => event.kind === "tool_attempt");
+    expect(attempts).toHaveLength(2);
+    expect(new Set(attempts.map((event) => event.pid)).size).toBe(2);
+    expect(new Set(attempts.map((event) => event.detail.idempotencyKey)).size).toBe(1);
+    expect(events.filter((event) => event.kind === "model_response")).toHaveLength(2);
   }, 50_000);
 
   it("serves the AgentCore HTTP contract with DynamoDB Local", async () => {

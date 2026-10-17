@@ -2,25 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import {
-  Type,
-  type AssistantMessage,
-  type TranscriptContext,
-} from "@earendil-works/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
-import {
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxText,
-  fauxToolCall,
-  type FauxProviderState,
-} from "@earendil-works/pi-ai/providers/faux";
+import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import {
   AssistantEntry,
   createRegistry,
   defineExtension,
-  defineTool,
+  GenerationTask,
   Harness,
+  hook,
   watchEvents,
   type AgentEventStream,
   type Conversation,
@@ -31,6 +22,8 @@ import {
   createConfiguredAmazonBedrockProvider,
 } from "./bedrock-provider.js";
 import type { EventLog } from "./event-log.js";
+import { scriptedResponse } from "./scripted-model.js";
+import { durableWaitTool } from "./tools.js";
 import { openSessionBackend } from "./storage/open.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -65,49 +58,6 @@ export function sessionDirectory(
 ): string {
   const digest = createHash("sha256").update(sessionId).digest("hex");
   return join(stateDirectory, "sessions", digest);
-}
-
-function hasToolResultAfterLastUser(transcript: TranscriptContext): boolean {
-  let lastUser = -1;
-  for (let index = 0; index < transcript.messages.length; index++) {
-    if (transcript.messages[index]?.role === "user") lastUser = index;
-  }
-  return transcript.messages
-    .slice(lastUser + 1)
-    .some(
-      (message) =>
-        message.role === "toolResult" && message.toolName === "durable_wait",
-    );
-}
-
-function scriptedResponse(
-  transcript: TranscriptContext,
-  _options: unknown,
-  state: FauxProviderState,
-): AssistantMessage {
-  if (process.env.SCRIPTED_MODEL_ERROR === "1") {
-    return fauxAssistantMessage([], {
-      stopReason: "error",
-      errorMessage:
-        process.env.SCRIPTED_MODEL_ERROR_MESSAGE ??
-        "Provider is not configured: amazon-bedrock",
-    });
-  }
-  if (hasToolResultAfterLastUser(transcript)) {
-    return fauxAssistantMessage([
-      fauxText("Finished after the durable tool checkpoint was committed."),
-    ]);
-  }
-  return fauxAssistantMessage(
-    [
-      fauxToolCall(
-        "durable_wait",
-        { label: "crash-window" },
-        { id: `durable-wait-${state.callCount}` },
-      ),
-    ],
-    { stopReason: "toolUse" },
-  );
 }
 
 function unansweredPayload(settled: SettledSubmissionRecord): {
@@ -212,44 +162,25 @@ export class PiRuntime {
     const delayMs =
       options.scriptedDelayMs ??
       Number(process.env.SCRIPTED_TOOL_DELAY_MS ?? 5_000);
-    const waitTool = defineTool({
-      name: "durable_wait",
-      description:
-        "Wait briefly so process-crash recovery can be demonstrated.",
-      parameters: Type.Object({ label: Type.String() }),
-      replay: "safe",
-      execute: async ({ label }) => {
-        const attempt = {
-          timestamp: new Date().toISOString(),
-          pid: process.pid,
-          label,
-          sessionId: options.sessionId,
-        };
-        process.stdout.write(`TOOL_ATTEMPT ${JSON.stringify(attempt)}\n`);
-        await recorder.record("tool_attempt", attempt);
-        await recorder.record("tool_call_started", {
-          name: "durable_wait",
-          label,
-          delayMs,
-        });
-        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
-        await recorder.record("tool_call_completed", {
-          name: "durable_wait",
-          label,
-        });
-        return {
-          output: [
-            { type: "text" as const, text: `waited ${delayMs}ms for ${label}` },
-          ],
-        };
-      },
-    });
+    const scope = { sessionId: options.sessionId, events: recorder };
+    const waitTool = durableWaitTool(scope, delayMs);
 
     const registry = createRegistry();
     registry.install(
       defineExtension({
         name: "poc-durable-wait",
         tools: [waitTool],
+        hooks: [
+          hook(GenerationTask, {
+            afterResponse: (message) =>
+              recorder.record("model_response", {
+                stopReason: message.stopReason,
+                toolCalls: message.content.filter(
+                  (item) => item.type === "toolCall",
+                ).length,
+              }),
+          }),
+        ],
       }),
     );
 
